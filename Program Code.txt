@@ -1,0 +1,23 @@
+
+As they are clocked in (may be backwards) Looks like 6 bytes?
+
+
+1 | 00000110	01100000
+
+0 | 11000001	10000011
+
+1 | 00001000	00010000
+
+0 | 00000000	00000000
+
+0 | 00000010	01000000
+
+0 | 11111111	11111111
+
+
+1 | 00000001	Looks like the "I'm Here" flag 0xF0
+
+Normal data resumes
+
+
+

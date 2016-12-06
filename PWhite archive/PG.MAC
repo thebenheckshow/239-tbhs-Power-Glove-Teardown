@@ -1,0 +1,4057 @@
+
+;------------------------------------------------------;
+;      Nintendo Glove Peripheral operating system      ;
+;                                                      ;
+;        COP888 Version  (C) 1989 After Science        ;
+;------------------------------------------------------;
+; Version 2: (44 pin package, transmitters on hand)
+
+	.title pg, 'Power Glove  3-13-1989'
+
+	.list 	021		; Turn on include file listing
+
+	.incld	COP888.INC		; Include port definitions
+
+	.incld	PGMEM.INC		; Include memory allocations
+
+	.incld	PGCON.INC		; Include constant values
+
+	.=	00		; RESET Program entry point
+TOP:
+	RBIT	GIE,PSW		; Disable interrupts before starting
+
+; Set port configurations (I/O)
+; PORT L:	BIT7	= 0	Unused I/O
+;		BIT6	= 1	Flex Reset output
+;		BIT5	= 0	Timer 2B INPUT - flex comparator input
+; 		BIT4	= 0	Timer 2A INPUT - Vertical receiver
+;		BIT3	= 0	Flex 4 control output
+;		BIT2	= 0	Flex 3 control output
+;		BIT1	= 0	Flex 2 control output
+;		BIT0	= 0	Flex 1 control output
+
+	LD	PORTLC,#040	; Start with all flex off, discharge active
+
+	LD	PORTLD,#0	; set data bits low for tri-state
+
+; PORT L WAKE-UP: Disable.
+
+	LD	WKEN,#0		; Clear enable bits (8)
+	LD	WKPND,#0	; Clear any pending bits
+	
+; PORT C:	BIT7	= 0	Unused I/O
+;		BIT6	= 0	Switch row select  x  x  x  x CL EN  9  8
+;		BIT5	= 0	Switch row select  7  6  5  4  3  2  1  0
+;		BIT4	= 0	Switch row select  A  B sl st  D  E  C  F
+;		BIT3 	= 1	NINTENDO PORT UP* BUTTON (OUTPUT)
+;		BIT2	= 1	NINTENDO PORT DOWN* BUTTON
+;		BIT1	= 1	NINTENDO PORT LEFT* BUTTON
+;		BIT0	= 1	NINTENDO PORT RIGHT* BUTTON
+
+	LD	PORTCC,#00F	; Set all switch row selects to tri-state
+	LD	PORTCD,#08F	; N port data = high (inactive)
+				; Switch selects = low (when not tri-state)
+				; Bit 7 = Inhibit joystick output (until
+				; START button is pressed)
+
+; PORTG:	BIT7	= 1	CKO (not connected)
+;		BIT6	= 0	SI (NLOAD INPUT)
+;		BIT5	= 0	SK (NCLOCK I/O - used as input)
+;		BIT4	= 1	SO (not connected)
+;		BIT3	= 0	T1A INPUT - Horizontal receiver
+;		BIT2	= 0	T1B INPUT - Middle receiver
+;		BIT1	= 1	WDOUT (Watchdog output - not used)
+;		BIT0	= 0	INT (NLOAD INTERRUPT INPUT)
+
+;;;;	LD	PORTGC,#092
+	LD	PORTGC,#0D2	; Alternate SK phase
+;;;;	LD	PORTGD,#03F	; Enable weak pullups on inputs
+
+; Use PORTGP to read port G input pins - not PORTGD
+
+; PORT I: Is input only - no configuration needed
+; PORT D: Is output only - no configuration needed
+; except - set port D outputs to inactive state
+
+; PORTD:	BIT7	= Nintendo port output (A)
+;		BIT6	= Nintendo port output (B)
+;		BIT5	= Nintendo port output (Select)
+;		BIT4	= Nintendo port output (Start)
+;		BIT3	= High voltage exciter output
+;		BIT2	= LED / Piezo buzzer output
+;		BIT1	= Ultrasonic 2 output (right side of hand)
+;		BIT0	= Ultrasonic 1 output (left side of hand)
+
+	LD	PORTD,#0FC	; (set bits 7-4 and 3,2 high)
+
+	LD	B,#SWR0H	; ($F7)
+	LD	[B+],#0FF	; Initialize switch history
+	LD	[B+],#0		; Turn off all pulse mode mask bits: PUL1MASK
+	LD	A,[B+]		; (skip over PUL1CT)
+	LD	[B+],#0		; PUL2MASK
+	LD	A,[B+]		; (skip over PUL2CT)
+
+	LD	[B+],#10	; X <- 10
+	LD	[B],#06F	; SP <- $6F ( LD	SP,#06F )
+
+; Kill some time in case of Reset line bouncing - don't allow RAM integrity
+; variables to be overwritten until everything has stabilised.
+;
+	JSR	BEEP		; Beep on power-up
+
+; Initialize HMV variables to some plausible value ($1000 = 4.5 feet)
+	LD	B,#OldH1L
+ZVAR:
+	LD	[B+],#0
+	LD	[B+],#010
+	IFBNE	#ENDZV
+	JP	ZVAR
+
+; Some variables are reset only on a cold start (RAM not intact)
+; On an orderly shutdown, the following values are stored in RAM
+; at addresses 0 - 3;  1, 2, 3, 4.
+; If these values are all there at this time, don't load new template.
+;
+	LD	SP,#06F		; Initialize the stack pointer 
+
+	LD	B,#0		; Use RAM locations 0 - 3 for power down
+CHKRAM:				; flag.  If RAM is ok, data should
+	LD	A,[B+]		; equal address + 1 .
+	IFNE	A,B
+	JP	BADRAM
+
+	IFBNE	#4
+	JP	CHKRAM
+
+	JP	RAMVALID
+BADRAM:
+; If RAM wasn't intact, reinitialize the default template
+;
+	JSR	LoadZTemplate	; Default template
+
+; Also reset the following variables only if memory dumped...
+;
+	LD	B,#PUL1RATE
+	LD	[B+],#DEFP1		; Set initial pulse rate
+	LD	[B],#DEFP2		; values (includes on/off state)
+
+RAMVALID:
+WARMSTART:
+	LD	NPORT,#0FF	; Initialize Nintendo output buffer
+
+; Initialize data pointers 
+	RBIT	IFLG,ECHOFLAGS
+
+	LD	GLBFLAGS,#CAMASK	; Force CENTER op. first time through
+
+	LD	WKEDG,#0		; reset up/down load flags
+					; (CLEAR EDIT MODE1 FLAG)
+	JSR	BUILDTAB		; If this is a glove mode program,
+					; set up list of variables in RAM
+; Set up timer 1 
+; and external interrupt
+
+	LD	CNTRL,#0E8	; Timer 1 mode 3, uWire on, INT rising edge
+				; Capture negative edges  T1A & T1B
+	SBIT	4,PSW		; Enable timer 1A edge / T1 underflow interrupt
+
+	LD	ICNTRL,#015	; Enable timer 1B edge interrupt
+				; Enable uWire interrupt
+				; Enable T0 bit12 toggle interrupt
+				; clear GPDRDY flag
+; Set up timer 2 
+
+	LD	T2CNTRL,#064	; 3/3/89 New flex circuit - T2B positive edge
+;;;	LD	T2CNTRL,#0E4	; (T2B int disabled)
+				; Timer 2 mode 3, both A & B interrupts enabled
+				; negative edge capture
+
+	JMP	START
+
+;--------------------------------;
+; Reset flex minimums and maximums
+;--------------------------------;
+RSTFLEX:			; 
+	LD	B,#THMMAX
+FX0L:
+	LD	[B+],#0		; Set minimums to FF, set maximums to 0
+	LD	[B+],#0FF
+
+	IFBNE	#ENDFX
+	JP	FX0L
+
+	RET
+
+;--------------------------------;
+; LED / buzzer routines          ;
+;--------------------------------;
+;
+BEEP:
+	LD	DREG,#255	; Long tone
+	JP	BUZZ
+LBLIP:
+	LD	DREG,#18	; Short tone
+	LD	CREG,#94	; Low freq.
+	JP	BUZZ1
+BLIP:
+	LD	DREG,#18	; Short tone
+BUZZ:
+	LD	CREG,#62	; High freq.
+BUZZ1:
+	RBIT	GIE,PSW		; Disable interrupts globally
+
+	LD	B,#PORTD
+OSCLOOP:
+	RBIT	2,[B] 	; (turn on LED and piezo)
+	LD	A,CREG
+
+	IFBIT	7,PORTLP	; Check feedback input
+	JP	NOOSC1		; quit if voltage is high enough
+
+	SBIT	3,[B]		; Set PORTD bit 3
+	NOP			; Delay high period
+	RBIT	3,[B]		; Clear bit 
+NOOSC1:
+B120L:
+	DEC	A
+	ANDSZ	A,#0FF
+	JP	B120L
+	
+	SBIT	2,[B] 	; (turn off LED)
+	LD	A,CREG
+
+	IFBIT	7,PORTLP	; Check feedback input
+	JP	NOOSC2		; quit if voltage is high enough
+
+	SBIT	3,[B]		; Set PORTD bit 3
+	NOP			; Delay high period
+	RBIT	3,[B]		; Clear bit 
+NOOSC2:
+B121L:
+	DEC	A
+	ANDSZ	A,#0FF
+	JP	B121L
+	
+	DRSZ	DREG		;
+	JP	OSCLOOP		;
+
+	SBIT	GIE,PSW		; Enable interrupts globally
+
+	RET
+
+;--------------------------------;
+; Data output routine for Glove  ;
+; program mode                   ;
+;--------------------------------;
+; Copy next byte to the Nintendo port
+
+GloveOut:			; Table of data addresses must be set up in RAM
+				; before getting this far...		
+	LD	A,[X+]		; X is table pointer 
+
+	IFNE	A,#0FF		; Watch for end marker ($FF)
+	JP	VALADDR
+
+	RBIT	GPDRDY,ICNTRL	; Cancel upload when data runs out
+	JP	GOFINI		; (put FF on port before quitting)
+VALADDR:
+	X	A,B		; Load data address indirect from RAM table
+	LD	A,[B]		; Get data in A
+GOFINI:
+	JMP	NintendoOut	; put it on port
+
+;--------------------------------;
+; Data output routine - Joystick ;
+;--------------------------------;
+; Copy buffer to the Nintendo port
+
+JoyOut:
+	LD	A,#0FF
+	IFBIT	MODE1,WKEDG	; Edit mode ?
+	JP	JO1		; All N. switches off
+
+	IFBIT	7,TEMPLATE	; Glove mode ? - no joystick output
+JO1:	JMP	NintendoOut
+
+	IFBIT	7,PORTCD	; Check power-up joystick inhibit flag
+	JP	NOUT2		; Send FF if not ready yet
+
+; Get current status of switches
+; Control lines should be set for reading row 0, which can be masked directly 
+; into NPORT
+
+	LD	A,PORTI		; Glove keypad switches
+	ANDSZ	A,#020		; SELECT ?
+	JP	QU2
+
+	JP	NOUT2
+QU2:
+	ANDSZ	A,#010		; START ?
+	JP	QU3
+
+	JP	NOUT2		; Ignore NPORT if either START or SEL is active
+QU3:
+	AND	A,NPORT		; NPORT is generated by glove language
+;
+	LD	B,#PUL1RATE
+	IFBIT	PULON,[B]	; Check pulse mode phase
+	JP	P1ACTIVE
+P1RETURN:
+	LD	B,#PUL2RATE
+	IFBIT	PULON,[B]	; Check pulse mode phase
+	JP	P2ACTIVE
+P2RETURN:
+	LD	B,#WKEDG
+	IFBIT	SLOMO,[B]
+	JP	SMACTIVE
+NOUT2:
+	JP	NintendoOut
+
+P1ACTIVE:		; Pulse 1 mode is on - check timer phase
+	IFBIT	PULPHS,[B]
+	OR	A,PUL1MASK	; If in off phase, set selected bits high -
+	JP	P1RETURN	; overriding continuous and button states.
+
+P2ACTIVE:		; Same again for pulse timer 2...
+	IFBIT	PULPHS,[B]
+	OR	A,PUL2MASK
+	JP	P2RETURN
+
+SMACTIVE:		; Slo mo mode is on - check phase
+	IFBIT	SLOMOP,[B]
+	AND	A,#0EF	; Toggle START button bit
+			; If in off phase, set selected bits low -
+			; overriding continuous and button states.
+
+NintendoOut:			; Send byte in A to Nintendo Port
+	LD	B,#IREG		; (Because we use IREG, interrupts
+				; must be disabled when this routine is 
+				; called from system time program.)
+	PUSH	A
+	AND	A,#0F0
+	X	A,[B]
+	LD	A,PORTD 	; Save current port status of lower 4 bits
+	AND	A,#00F
+	OR	A,[B]		; OR in new status for port L
+	X	A,PORTD 
+	POP	A
+	AND	A,#00F		; Port C 
+	X	A,[B]
+	LD	A,PORTCD	; Port C data reg.
+	AND	A,#0F0		; Save upper bits
+	OR	A,[B]
+	X	A,PORTCD	; Write new data out
+	
+	IFBIT	IFLG,ECHOFLAGS
+	JP	JOYEND
+
+	RET
+
+;--------------------------------;
+; Hardware Interrupt Vector      ;
+;--------------------------------;
+; This is where the hardware interrupt goes first
+	.=	00FF
+INTSERVICE:
+	
+	PUSH	A		; Save A, B & Carry bits before vectoring
+	X	A,B
+	PUSH	A
+	LD	A,PSW
+	PUSH	A
+	VIS			; Go look at highest priority interrupt
+				; (using table at 1E0)
+
+;--------------------------------;
+JOYEND:
+	RBIT	IFLG,ECHOFLAGS
+	JMP	NOTHING
+
+;--------------------------------;
+; Load Indirect Instruction      ;
+; (Must be located on the same   ;
+; page as the table)             ;
+;--------------------------------;
+LoadIndirect:
+	LAID
+	RET
+
+;*********************************
+QTABLE:		;Rotation table
+;*********************************
+	.BYTE	3,4,5,0,1,2,8,7,6,11,10,9
+
+;*********************************
+; Switch translation tables
+;*********************************
+TABL0:
+	.BYTE	081,080,009,008			; 80 = Enter, 81 = Clear
+	.BYTE	007,006,005,004,003,002,001,000
+	.BYTE	00A,00B,083,082,00D,00E,00C,00F	; 82 = Start, 83 = Select
+
+;*********************************
+; Bit masks
+;*********************************
+BITMASK:
+	.BYTE	01,02,04,08,010,020,040,080
+
+;*********************************
+; Fudge factor table for calculating rotation
+;*********************************
+ZADJTABLE:
+	.BYTE	21,18,14,10,8,7,6,5,4,4,3,3,3,2,2,2
+
+;*********************************
+; Adjustment table for flex
+;*********************************
+FLXTAB:		; Non linear flex adjustments
+	.BYTE	0,0,0,0,0,1,1,1,2,2,2,3,3,3,3,3
+
+THMTAB:		; Separate table for the thumb
+	.BYTE	0,0,0,1,1,1,1,2,2,2,3,3,3,3,3,3
+
+;--------------------------------;
+; Build upload table             ;
+;--------------------------------;
+
+BUILDTAB:
+	LD	B,#TEMPLATE
+	IFBIT	7,[B]		; Do this only if glove mode is ON
+	JP	BT
+ZSTAT:				; Zero all status bits at this time
+	LD	GSTAT1,#0	; (Gesture status)
+	LD	GSTAT2,#0
+
+	RBIT	5,PUL2RATE	; Reset AB Swap flag 3/9/89
+
+	RET
+
+; Set up upload pointers
+;
+BT:
+	LD	A,[B]
+	RLC	A		; Locate bitmap of upload values in template
+	AND	A,#01E		; mask all but gesture byte count
+	INC	A		; Add 2 for template header and logic byte
+	INC	A		; count 
+	ADD	A,#TEMPLATE
+	X	A,B
+	LD	A,[B+]		; Save bitmap in GSTAT
+	X	A,GSTAT1
+	LD	A,[B+]
+	X	A,GSTAT2	; 
+; Build list of data addresses following logic in template
+	LD	A,B		; RAM address in B is transferred to X
+	PUSH	A
+	X	A,X		; 	
+	POP	A
+	X	A,GBASE		; Save pointer for upload routine to use
+
+	LD	CREG,#0		; Initialize bit counter
+BATLOOP:
+	LD	A,CREG
+	JSR	GBX		; Get B pointer to GSTAT1 or 2 and A=bitmask
+	AND	A,[B]
+	IFNE	A,#0
+	JP	PUTONE
+BATCAVE:
+	JSR	INCREG		; Increment CREG
+	IFNE	A,#15		; (value of CREG before incrementing) = 15 ?
+	JP	BATLOOP
+
+	LD	A,#0FF
+	X	A,[X]		; Put FF marker at end of list
+	JMP	ZSTAT
+
+PUTONE:				; Put a pointer in the table
+	LD	A,CREG
+	ADD	A,#L(IATABLE)
+	LAID
+	X	A,[X+]
+	JP	BATCAVE
+
+IATABLE:		;(allow space here for 16 values)
+	.BYTE	XABS
+	.BYTE	YABS
+	.BYTE	ZABS
+	.BYTE	ROTATION
+	.BYTE	FLEXMAP
+	.BYTE	SWR0H
+	.BYTE	GSTAT1
+	.BYTE	GSTAT2
+	.BYTE	RVALID
+
+;--------------------------------;
+; Timer 2A edge capture/timeout  ;
+;--------------------------------;
+; Vertical receiver
+;
+T2ACAPT:			; Timer 2A event capture - Ultra sensor 3
+	LD	B,#T2CNTRL
+	RBIT	3,[B]		; Clear edge interrupt pending flag
+
+; See if this is an underflow (time out)
+	IFBIT	4,[B]		; Check underflow interrupt pending flag
+	JP	TIMEOUT
+
+	IFBIT	VIV,ECHOFLAGS	; Has this interrupt been serviced before ?
+	JP	T2AECHO		; If so, exit
+
+	IFBIT	PE0,WKEDG	; Are we in a real listening period or
+	JP	T2AECHO		; just a flex-only period ?
+
+; Since timer counts down, to get a real time value, the timer data must be 
+; subtracted from the initial timer value.
+
+	LD	B,#NewRVL
+
+	SC			; Set carry - preparation for subtraction
+	LD	A,#T0LO		; Load initial timer value LO
+	SUBC	A,T2RALO	; Subtract captured timer value
+	X	A,[B+]
+	LD	A,#T0HI		; Load initial timer value HI
+	SUBC	A,T2RAHI	; Subtract captured timer value
+	X	A,[B]		; Store result in Newx1n
+
+	SBIT	VIV,ECHOFLAGS	; Set flag showing that pulse has been recieved
+	JP	T2AECHO		; Return from interrupt, restoring registers
+
+TIMEOUT:
+; (Do watchdog service now)
+;;;	LD	WDCNT,#BONE	; Service watchdog register	
+
+	RBIT	4,[B]		; Clear interrupt pending flag
+	SBIT	T2FIN,ECHOFLAGS	; Set flag so main program will know to 
+T2AECHO:			; start another beep/listen cycle
+	JMP	NOTHING		;
+
+;--------------------------------;
+; Get (MAX - MIN) / n            ;
+;--------------------------------;
+; B must point to selected maximum value
+GETDIF:
+	SC
+	LD	A,[B+]
+	SUBC	A,[B]
+	SWAP	A		; / 16
+	AND	A,#0F
+	RET
+	
+;--------------------------------;
+; Table of interrupt vectors     ;
+;--------------------------------;
+
+	.=	01E0		; Table of interrupt vectors
+				; (Starting with the lowest priority...)
+; VIS instruction w/o any pending interrupts
+	.BYTE	H(NOTHING),L(NOTHING)
+; Port L edge interrupt
+	.BYTE	H(LEDGE),L(LEDGE)
+; Reserved for future use
+	.BYTE	H(NOTHING),L(NOTHING)
+; Reserved for future use
+	.BYTE	H(NOTHING),L(NOTHING)
+; Timer 2B Capture edge
+	.BYTE	H(NOTHING),L(NOTHING)	; no longer used for T2BCAPT
+; Timer 2A Capture edge / T2 underflow
+	.BYTE	H(T2ACAPT),L(T2ACAPT)
+
+;; 1EC	Reserved for UART
+;; 1EE	Reserved for UART
+;; 1F0	Reserved for future use
+
+;>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>;
+LEDGE:	; NOT USED		; SWINT supported as a safety feature
+SWINT:				; SOFTWARE INTERRUPT (INTR instruction)
+	RPND			; Reset pending software interrupt flag
+	LD	SP,#06F		; Initialize the stack pointer 
+
+	JMP	WARMSTART	; Restart
+;>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>;
+
+	.=	01F2
+; Microwire BUSY goes low
+	.BYTE	H(MICROWIRE),L(MICROWIRE)
+; Timer 1B Capture edge
+	.BYTE	H(T1BCAPT),L(T1BCAPT)
+; Timer 1A Capture edge / T1 underflow
+	.BYTE	H(T1ACAPT),L(T1ACAPT)
+; Timer 0 bit 12 toggle
+	.BYTE	H(T0TOGGLE),L(T0TOGGLE)
+; Pin G0 edge
+	.BYTE	H(G0EDGE),L(G0EDGE)
+; Reserved for future use
+	.BYTE	H(NOTHING),L(NOTHING)
+; Software interrupt (Highest priority)
+	.BYTE	H(SWINT),L(SWINT)
+
+;--------------------------------;
+; Check last state of pulse mask ;
+;--------------------------------;
+CLSTATE:		; Reset Pulse timer N if previous mask bit was 0
+; A = mask bit (1)
+; B points to mask, count - 1
+; X points to rate var.
+	AND	A,[B]		; Test last bitmask state
+	IFNE	A,#0		; If it was 1 last time, return
+	RET
+
+	LD	A,[B+]		; Increment B to: PULxCT
+
+	RBIT	GIE,PSW
+	LD	A,[X]		; Clear the phase bit
+	AND	A,#07F		
+	X	A,[X]		; Reset the count value based on rate var.
+	SBIT	GIE,PSW
+
+	AND	A,#01F
+	ADD	A,#L(RATETABLE)
+	JMP	LDAIND		; Get rate from table & store at [B]
+
+;--------------------------------;
+; Interrupt service routines     ;
+;--------------------------------;
+
+;--------------------------------;
+; Timer 0 generates an interrupt :
+; every 4.096ms                  ;
+;--------------------------------;
+T0TOGGLE:
+	RBIT	5,ICNTRL	; Reset T0 bit12 toggle interrupt pending bit
+
+; Do pulse timer 1
+	LD	B,#PUL1CT
+
+	LD	A,[B]		; Decrement PULSE1 count
+	IFEQ	A,#0		; Toggle phase and reset count when
+	JP	TGLP1		; it reaches 0.
+
+	DEC	A
+	JP	SVT1
+TGLP1:
+	LD	A,PUL1RATE	; Toggle the phase bit
+	XOR	A,#080
+	X	A,PUL1RATE	; Reset the count value based on rate var.
+	AND	A,#01F
+	ADD	A,#L(RATETABLE)
+	LAID			; Get rate from table
+SVT1:
+	X	A,[B+]		; Bump pointer to PUL2CT
+	LD	A,[B+]		; (increment 2 times)
+; Do pulse timer 2
+	LD	A,[B]		; Decrement PULSE2 count
+	IFEQ	A,#0		; Toggle phase and reset count when
+	JP	TGLP2		; it reaches 0.
+
+	DEC	A
+	JP	SVT2
+TGLP2:
+	LD	A,PUL2RATE	; Toggle the phase bit
+	XOR	A,#080
+	X	A,PUL2RATE	; Reset the count value based on rate var.
+	AND	A,#01F
+	ADD	A,#L(RATETABLE)
+	LAID			; Get rate from table
+SVT2:
+	X	A,[B]
+
+; Fall through...
+;--------------------------------;
+
+NOTHING:
+	RC			; Clear C & HC bits in PSW
+	POP	A		; Get saved C, HC
+	AND	A,#0C0
+	OR	A,PSW		; Put back into PSW
+	X	A,PSW		; carry and half-carry restored.
+
+	POP	A		; Restore B
+	X	A,B
+
+	POP	A		; Restore A
+
+	RETI			; Return from interrupt
+
+;--------------------------------;
+; Load indirect from this page   ;
+;--------------------------------;
+LDAIND:			; (and store at [B])
+	LAID
+	X	A,[B]		; Load up new timer count
+	RET
+
+;*********************************
+; Rate to countdown conversion 
+;*********************************
+QRTABLE:	; Extension of ratetable used for audible beeps
+	.BYTE	230,205,182
+RATETABLE:	; Pulse mode countdown rates
+	.BYTE	162,144,128,114,102,90,81,72
+	.BYTE	64,57,51,45,40,36,32,29
+	.BYTE	25,23,20,18,16,14,13,11
+	.BYTE	10,9,8,7,6,5,4,3
+
+;--------------------------------;
+; Timer 1A edge capture/timeout  ;
+;--------------------------------;
+; Horizontal Receiver
+;
+T1ACAPT:			; Timer 1A event capture
+	RBIT	5,PSW		; Clear interrupt pending flag
+	
+; See if this is an underflow (time out)
+	IFBIT	4,CNTRL		; Check underflow interrupt pending flag
+	JP	T1Aout
+
+	IFBIT	HIV,ECHOFLAGS	; Has this interrupt been serviced before ?
+	JP	T1AECHO		; If so, set appropriate flag
+
+; Since timer counts down, to get a real time value, the timer data must be 
+; subtracted from the initial timer value.
+
+	LD	B,#NewRHL
+
+	SC			; Set carry - preparation for subtraction
+	LD	A,#T0LO		; Load initial timer value LO
+	SUBC	A,T1RALO	; Subtract captured timer value
+	X	A,[B+]
+	LD	A,#T0HI		; Load initial timer value HI
+	SUBC	A,T1RAHI	; Subtract captured timer value
+	X	A,[B]		; Store result in NewRH
+
+	SBIT	HIV,ECHOFLAGS	; Set isValid flag - pulse was recieved
+	JP	T1AECHO		; Return from interrupt, restoring registers
+T1Aout:
+	RBIT	4,CNTRL		; Reset underflow pending bit
+	SBIT	T1FIN,ECHOFLAGS	; Set bit to let main program know that
+T1AECHO:			; timer 1 has timed out
+	JMP	NOTHING
+
+;--------------------------------;
+; Timer 1B edge capture          ;
+;--------------------------------;
+; Middle Receiver
+;
+T1BCAPT:			; Timer 1B event capture
+	RBIT	1,ICNTRL	; Clear interrupt pending flag
+	
+	IFBIT	MIV,ECHOFLAGS	; Has this interrupt been serviced before ?
+	JP	T1AECHO		; If so, exit
+
+; Since timer counts down, to get a real time value, the timer data must be 
+; subtracted from the initial timer value.
+
+	LD	B,#NewRML
+
+	SC			; Set carry - preparation for subtraction
+	LD	A,#T0LO		; Load initial timer value LO
+	SUBC	A,T1RBLO	; Subtract captured timer value
+	X	A,[B+]
+	LD	A,#T0HI		; Load initial timer value HI
+	SUBC	A,T1RBHI	; Subtract captured timer value
+	X	A,[B]		; Store result in NewRM
+
+	SBIT	MIV,ECHOFLAGS	; Set isValid flag - pulse was recieved
+
+	JP	T1AECHO		; Return from interrupt, restoring registers
+
+;--------------------------------;
+; Nintendo LOAD (external int.)  ;
+;--------------------------------;
+
+G0EDGE:			; Nintendo LOAD signal generates this interrupt
+	RBIT	IPND,PSW	; Clear interrupt pending bit
+
+	IFBIT	4,TEMPLATE	; Check download inhibit bit
+	JP	NOLOAD
+
+	LD	IREG,#4
+	IFBIT	SI,PORTGP	; Test pin G6 ( microwire SI )
+	JP	LOADHIGH	; NLOAD still high ?
+NOLOAD:
+	SBIT	IFLG,ECHOFLAGS	; Flag to tell JoyOut how to finish...
+
+	IFBIT	GPDRDY,ICNTRL	; Test Glove program/Joystick program mode bit
+	JMP	GloveOut
+
+	JMP	JoyOut		; If in joystick mode, send out current
+				; switch data.
+LOADHIGH:			; Load line is still high in interrupt -
+	IFBIT	SI,PORTGP
+	JP	LDHIG		; Continue testing...
+
+	JP	NOLOAD		; Ooops - load didn't stay high long enough
+				; to qualify	
+LDHIG:
+	DRSZ	IREG
+	JP	LOADHIGH	; If load line stays high for a while, 
+				; go to download mode (Nintendo to glove)
+
+; Unless upload is in progress - in that case, just cancel upload.
+
+	IFBIT	GPDRDY,ICNTRL
+	JMP	UPNOTHING
+
+;--------------------------------;
+; Begin Download                 ;
+;--------------------------------;
+; Prepare uWire for shifting in data
+; Stay in this mode until finished - do a warm start recovery to exit
+;
+	SBIT	UPDN,WKEDG	; Set upload/download mode ON
+
+	RBIT	GPDRDY,ICNTRL	; Clear upload mode
+
+	RBIT	BYTE1,CNTRL	; Clear 1st byte flag (download mode)
+
+; uWire interrupt will signal when BUSY goes low again,
+; after 8 bits have been shifted.
+
+; Reset stack pointer
+	LD	SP,#06F
+
+	RBIT	IFLG,ECHOFLAGS	; (use as normal subroutine)
+	LD	A,#0F0		; Send "here I am" message to Nintendo
+	JSR	NintendoOut
+
+; Disable G0 edge interrupt until download finished 
+	RBIT	1,PSW
+
+; Disable all other interrupts
+; Enable interrupts globally
+	JSR	INTSOFF
+
+; Enable uWire interrupt
+	LD	B,#PSW
+	RBIT	BUSY,[B]	; Reset busy just in case
+	RBIT	3,ICNTRL	; Reset uWire pending flag
+
+	SBIT	BUSY,[B]	; Get uWire register ready to accept data.
+
+DOWNLD:
+	IFBIT	UPDN,WKEDG
+	JP	DOWNLD
+
+	IFBIT	BYTE1,CNTRL	; Is this the first byte since the sync ?
+	JP	DLCOMPL
+
+	SBIT	1,[B]		; Reenable G0 edge interrupt
+	JSR	INTSON		; and the others...
+
+	JMP	MAINLOOP	; No data was downloaded...
+
+DLCOMPL:			; If bit 6 in template header is set, beep now.
+	IFBIT	6,TEMPLATE
+	JSR	BEEP
+
+; If bit 5 in template header is set, enter halt mode now.
+	IFBIT	5,TEMPLATE
+	JMP	SHUTDOWN
+RECOVER:
+	JMP	WARMSTART
+	
+;--------------------------------;
+; Microwire interrupt            ;
+;--------------------------------;
+; Byte has been shifted into SIOR register
+;
+MICROWIRE:
+	RBIT	3,ICNTRL	; Reset uWire interrupt pending bit
+
+	IFBIT	UPDN,WKEDG	; Download in progress ?
+	JP	DOONLD
+
+	JP	NTHN		; Exit if not in download mode
+DOONLD:
+	IFBIT	BYTE1,CNTRL	; Is this the first byte since the sync ?
+	JMP	MOREBITS	; No, go save the byte
+
+; First byte after sync signal on load line :
+	LD	A,SIOR		; Load data from microwire shift register
+	IFEQ	A,#0
+	JP	UPNOTHING	; If data byte count = 0, this must be an
+				; upload - not a download
+	IFGT	A,#TEMPSIZE+2	; (allow setting pulse mode variables)
+	JP	UPNOTHING	; Watch for illegal values
+
+	SBIT	BYTE1,CNTRL	; Cancel 1st byte mode
+
+	X	A,GBASE		; Use GBASE as byte count for download
+
+	LD	X,#TEMPLATE	; Set up address pointer for download
+WAITCLK:
+;;;	IFBIT	SK,PORTGP	; Wait for clock line to go low before setting 
+;;;	JP	WAITCLK		; BUSY bit. ;;;assume maximum clock high period
+
+	SBIT	BUSY,PSW	; Set busy so we can receive next byte
+NTHN:
+	JMP	NOTHING
+UPNOTHING:
+	RBIT	GPDRDY,ICNTRL	; Clear upload mode
+	RBIT	UPDN,WKEDG	; Clear download mode
+
+	LD	B,#PSW
+	RBIT	3,[B]		; Clear any pending ext interrupts
+	SBIT	1,[B]		; Reenable G0 edge interrupt
+
+	JP	NTHN
+MOREBITS:
+	LD	A,SIOR		; Get data from uWire shift register
+
+	X	A,[X+]		; Store in RAM and increment pointer
+
+	DRSZ	GBASE		; Decrement byte count
+	JP	WAITCLK		; cancel download when finished
+
+; When byte count reaches zero...
+	JP	UPNOTHING
+
+;--------------------------------;
+; Timer 2B edge capture          ;
+;--------------------------------;
+; Flex timer - subroutine
+;
+T2BCAPT:		; Timer 2B event capture - Flex input falling edge
+;							(rising)
+	RBIT	1,T2CNTRL	; Clear interrupt pending flag
+
+	SC
+	LD	A,#T0LO
+	SUBC	A,T2RBLO	; Store timer count in RAM as current value
+	X	A,X
+	LD	A,#T0HI
+	SUBC	A,T2RBHI
+
+; Scale 16 bit flex timer down to 8 bits 
+; Divide A:IREG by 2^N to get 8 bit current value
+;
+	LD	B,#0A		; Divide by 2^5
+	RC			; Start with carry clear
+DV16:
+	RRC	A		; Rotate A -> into C
+	X	A,X		; Switch bytes
+	DRSZ	B
+	JP	DV16
+
+; Limit to {0 - 255}
+	ANDSZ	A,#007		; Test high byte
+	LD	X,#0FF		; and clip low byte if overflowed
+
+; Get pointer to correct flex variables in B
+;
+	LD	A,WKEDG		; LS 2 bits index which flex to update
+	RLC	A
+	AND	A,#006
+	ADD	A,#THMMAX	; First var. is thumb max
+	X	A,B		; Put pointer in B
+		
+; Update minimum or maximum values if neccessary
+;
+	LD	A,X		; (Current value)
+	IFGT	A,[B]		; Current > Maximum ?
+	JP	SETMAX
+
+	PUSH	A
+	LD	A,[B+]		; Increment B to minimum
+	POP	A
+
+	IFGT	A,[B]		; Current > Minimum ?
+	JP	FINDC
+SETMIN:
+	X	A,[B-]		; Update minimum value, move ptr to max
+	JSR	GETDIF		; ( MAX - MIN ) / 16	; [B] = min
+	PUSH	A
+	LD	A,[B-]		; Move ptr to max
+	POP	A
+	X	A,[B]		; Subtract DIF from max value
+	SC
+	SUBC	A,[B]
+	X	A,[B+]		; Move ptr to min
+
+	JP	FINDC
+SETMAX:
+	X	A,[B]		; set new maximum
+	JSR	GETDIF
+	ADD	A,[B]		; Add DIF to min value
+	X	A,[B]
+;
+; Find current position between min and max
+;
+FINDC:			; minimum < current <= maximum
+	LD	A,[B-]		; MIN
+
+	SC
+	LD	A,[B+]		; MAX
+	SUBC	A,[B]		; (max - min)
+
+; Divide (MAX - MIN) by 16 (table size)
+	RRC	A
+	RRC	A
+	RRC	A
+	RRC	A
+	AND	A,#00F
+	IFEQ	A,#00F
+	JP	NOCRY
+
+	IFC
+	INC	A		; Round up
+NOCRY:
+	IFEQ	A,#0
+	INC	A
+	X	A,CREG		; Save (MAX - MIN) / 16 in CREG
+
+	SC
+	LD	A,X		; Current
+	SUBC	A,[B]		; Current - MIN
+	X	A,X		; Save (Current - MIN) in X
+
+	CLR	A		; A <- 0
+	LD	B,#0		; B = table index
+SIGMA:
+	ADD	A,CREG		; Add (MAX - MIN)/16
+	IFGT	A,X		; A > (Current - MIN) ?
+	JP	TRIP
+
+	PUSH	A		; Increment B
+	LD	A,[B+]
+	POP	A
+	IFBNE	#15		; Cancel after B > 14
+	JP	SIGMA
+TRIP:
+	LD	A,WKEDG
+	AND	A,#03
+	IFEQ	A,#0
+	JP	THUMBS		; Special case for the thumb
+
+	X	A,B		; Put B in A
+	ADD	A,#L(FLXTAB)	; Add offset to flex table address
+	JP	FINGERS
+THUMBS:
+	X	A,B
+	ADD	A,#L(THMTAB)
+FINGERS:
+	JSR	LoadIndirect
+ITSTHIS:
+	X	A,X		; Save 2 bit flex value in IREG
+
+	LD	A,WKEDG
+	XOR	A,#03
+	RLC	A
+	AND	A,#006
+	X	A,B		; Shift count
+	LD	A,#003		; Bitmask for flexmap
+TESST:
+	RC
+	IFBNE	#0
+	JP	SHIFFT
+NEWFLEX:
+	XOR	A,#0FF		; Invert bitmask
+	AND	A,FLEXMAP
+	OR	A,X		; Stick in new flex value 3 3 2 2 1 1 0 0
+	X	A,FLEXMAP
+	
+	IFBIT	PE0,WKEDG	; Short cycle the timer routine if this 
+	JP	T2ABO		; is a flex-only phase.
+
+	RET
+T2ABO:
+	SBIT	T2FIN,ECHOFLAGS	; Set flag so main program will know to 
+	RET			; quit.
+
+SHIFFT:
+	RLC	A		; Half-Multiply A and IREG by 2
+	X	A,X
+	RLC	A
+
+	PUSH	A		; Decrement B without disturbing A
+	LD	A,[B-]
+	POP	A
+	JP	TESST
+
+;--------------------------------;
+; Main Program Start             ;
+;--------------------------------;
+
+START:
+; Set initial flex minimums and maximums
+;
+	JSR	RSTFLEX
+; Reset upload mode 
+	RBIT	UPDN,WKEDG
+
+	LD	B,#PSW
+	RBIT	3,[B]		; Clear any pending ext interrupts
+	SBIT	1,[B]		; Reenable G0 edge interrupt
+
+; 
+; Main loop is divided into 5 sections:
+; Period 1: 	Reset timer 1,2, transmit ultrasonic pulse 1 from hand
+;		capture T1A (H), T1B (M), T2A (V) - ultrasonic receivers
+;		capture T2B (FLEX 1)
+; end of period 1: discharge flex circuit
+;
+; Period 2: 	Reset timer 2
+;		capture T2B (FLEX 2)
+;		Validate ultrasonic data and update H1, M1, V1
+; end of period 2: discharge flex circuit
+;
+; Period 3: 	Reset timer 1,2, transmit ultrasonic pulse 2 from hand
+;		capture T1A (H), T1B (M), T2A (V) - ultrasonic receivers
+;		capture T2B (FLEX 3)
+; end of period 3: discharge flex circuit
+;
+; Period 4: 	Reset timer 2
+;		capture T2B (FLEX 4)
+;		Validate ultrasonic data and update H2, M2, V2
+; end of period 4: discharge flex circuit
+;
+; Period 5: Compute x,y,z,r, do template 
+;		scan keypad for data entry 
+;
+
+MAINLOOP:
+; First period - transmit ultrasonic pulse 1,
+; capture receivers H, M, V, get flex 1
+	LD	B,#WKEDG
+	RBIT	PE0,[B]
+	RBIT	PE1,[B]		; Set period 1 flags
+
+; Handle slo-mo toggle now
+	LD	A,[B]
+	XOR	A,#SMMASK
+	X	A,[B]
+
+	JSR	RSTCAPT		; Reset capture variables to old values
+
+	JSR	StartPeriod	; Reset timer counts
+	JSR	EnT1andT2	; enable both ultra and flex interrupts
+
+				; 3/3/89 new flex ckt
+	LD	PORTLD,#1	; PORTLD     Flex 1 = thumb
+	LD	PORTLC,#1	; PORTLC
+
+	JSR	TXPulse		; Transmit ultrasonic pulse
+	JSR	Capt4		; Wait for both timers to time out
+	LD	PORTLC,#040	; Turn off flex sensors
+
+; Second period - ultrasonic blanking period, ultrasonic validation of 
+; last data, read switches, get flex 1.
+
+	SBIT	PE0,WKEDG	; Set period 2 flags
+
+	JSR	FlexPeriod	; Reset timer counts
+	JSR	EnT2		; enable only flex interrupts
+	SBIT	GIE,PSW		; Enable interrupts globally
+
+				; 3/3/89 new flex ckt
+	LD	PORTLD,#2	; Flex 2 = Index finger
+	LD	PORTLC,#2	
+
+	JSR	Validate
+	JSR	ScanSw
+	JSR	Capt4		; Wait for timer 2 to time out
+	LD	PORTLC,#040	; Turn off flex sensors
+
+; Copy ECHOFLAGS to GLBFLAGS (receiver miss flags only)
+	LD	B,#GLBFLAGS
+	RBIT	7,[B]
+	RBIT	6,[B]
+	RBIT	5,[B]
+
+	LD	A,ECHOFLAGS
+	AND	A,#0E0
+	OR	A,[B]	; set bits in GLBFLAGS where bits are set in
+	X	A,[B]	; ECHOFLAGS...
+
+; Third period - transmit ultrasonic pulse 2,
+; capture receivers H, M, V, get flex 3
+
+	LD	B,#WKEDG
+	RBIT	PE0,[B]
+	SBIT	PE1,[B]		; Set period 3 flags
+
+	JSR	RSTCAPT		; Reset capture variables to old values
+
+	JSR	StartPeriod	; Reset timer counts
+	JSR	EnT1andT2	; enable both ultra and flex interrupts
+
+				; 3/3/89 new flex ckt
+	LD	PORTLD,#4	; Flex 3 = Middle finger
+	LD	PORTLC,#4		
+
+	JSR	TXPulse		; Transmit ultrasonic pulse
+	JSR	Capt4		; Wait for both timers to time out
+	LD	PORTLC,#040	; Turn off flex sensors
+		
+; Fourth period - ultrasonic blanking period, ultrasonic validation of 
+; last data, read switches, get flex 4.
+
+	SBIT	PE0,WKEDG	; Set period 4 flags
+
+	JSR	FlexPeriod	; Reset timer counts
+	JSR	EnT2		; enable only flex interrupts
+	SBIT	GIE,PSW		; Enable interrupts globally
+
+				; 3/3/89 new flex ckt
+	LD	PORTLD,#8	; Flex 4 = Ring finger
+	LD	PORTLC,#8	
+
+	JSR	Validate
+	JSR	ScanSw
+	JSR	Capt4		; Wait for timer 2 to time out
+	LD	PORTLC,#040	; Turn off flex sensors
+		
+; If glove mode, copy echoflags and glbflags to RVALID for upload purposes.
+	IFBIT	7,TEMPLATE
+	JP	VALD
+
+	JP	NOVALD
+VALD:
+	LD	X,#GLBFLAGS	; ECHOFLAGS follows immediately in RAM
+	LD	B,#RVALID
+	LD	A,[X+]		; Get R1 valid flags
+	SWAP	A
+	RRC	A		; Put in lower part of byte
+	AND	A,#007
+	X	A,[B]
+	LD	A,[X]		; Get R2 valid flags
+	RRC	A
+	RRC	A
+	AND	A,#038		; combine with R1 flags...
+	OR	A,[B]		; Result:
+	X	A,[B]		; / 0 / 0 /R2V/R2M/R2H/R1V/R1M/R1H/
+NOVALD:	
+; Fifth period - calculate X,Y,Z, R, do gesture interpretation and 
+; logic processing.
+	JMP	COMPUTE
+
+;--------------------------------;
+; Validate three receiver times  ;
+;--------------------------------;
+Validate:		; Validate last ultrasonic data received	
+; Compare new values to old values and reject if difference is > Constant value
+; Also incorporated: Jitter filtration (in ISVALID)
+; 
+TXTOK:	
+	IFBIT	CTR,GLBFLAGS	; If in center mode, skip this validation
+	JP	MAKEVALID
+
+	LD	CREG,#0		; Check H distance against old value
+	JSR	ISVALID		; Skip next statement if OK
+
+	LD	CREG,#2		; Check M distance against old value
+	JSR	ISVALID
+
+	LD	CREG,#4		; Check V distance against old value
+	JSR	ISVALID
+
+; "FEAROUT" validation routine - Test differences between pairs of
+; distances: H-M, M-V, H-V ... 
+
+	LD	CREG,#0
+	JSR	FEAROUT
+
+	LD	CREG,#2
+	JSR	FEAROUT
+
+	LD	CREG,#4
+	JSR	FEAROUT
+
+; Once new data has been validated, average with and copy to OLD variables	
+MAKEVALID:
+	CLR	A		; H
+	JSR	LDREGS		; GET B (new) and X (old)  pointers
+	JSR	AVERAGE
+
+	LD	A,#2		; M
+	JSR	LDREGS
+	JSR	AVERAGE	
+
+	LD	A,#4		; V
+	JSR	LDREGS
+	JMP	AVERAGE	
+
+;--------------------------------;
+; Validate data against old vals.:
+;--------------------------------;
+; A points to H, M or V variables
+;
+ISVALID:
+	JSR	LCREG
+
+	JSR	IFDIFFGTK	; Compare difference between [B] (new) and  
+	JMP	BADDATA		; [X] (old) to constant.
+
+; Check difference to see if there is jitter...
+; ACC1 still holds the absolute difference between old and new values
+
+	LD	B,#ACC1H
+	LD	A,[B-]		; If high byte is <> 0, skip this part
+	IFNE	A,#0
+	JP	GOODDATA
+
+	LD	A,[B]		; If diff is between 20 and 33 uSeconds, 
+
+;40 kHz ultrasonics:
+	IFGT	A,#27		; replace new value with old.
+	JP	GOODDATA
+				; ( 1 cycle of 40kHz +/- 25% )
+	IFGT	A,#20
+	JMP	BADDATA
+GOODDATA:	
+	RET			; Skip next statement after returning
+
+;--------------------------------;
+; Get new/old distance pointers  ;
+;--------------------------------;
+; A = pointer to H, M or V
+;
+LCREG:
+	LD	A,CREG
+LDREGS:			; A = {0, 2, 4}
+	PUSH	A
+	ADD	A,#NewRHL
+	X	A,B
+	POP	A
+
+	RC
+	RLC	A	; A = {0, 4, 8}
+	ADD	A,#OldH1L
+
+	IFBIT	PE1,WKEDG	; Use set 1 or 2 depending on phase of
+	ADD	A,#2		; operation
+
+	X	A,X
+	RET
+
+;--------------------------------;
+; Compare transmitter to another ;
+; that has already been validated;
+;--------------------------------;
+; CREG = offset for rcvr H, M or V
+
+FEAROUT:
+	JSR	LCREG		; Get new rcvr pointer in B, old in X
+	LD	A,B
+	ADD	A,#2		; Look at a different time
+
+	IFGT	A,#NewRVH
+	LD	A,#NewRHL	; Handle wrap around
+	X	A,X		
+
+	JSR	IFDIFFGTK
+	JP	BADDATA
+
+	RET
+
+BADDATA:
+	LD	A,CREG
+BADXA:
+	JSR	LDREGS
+
+	LD	A,[X+]		; Copy old value to new if new is out of range
+	X	A,[B+]	
+	LD	A,[X]
+	X	A,[B]	
+
+	RET
+
+;--------------------------------;
+; Compare 16 bit difference to   :
+; fixed  constant                ;
+;--------------------------------;
+; CREG is rcvr # offset (0 or 4)
+;
+IFDIFFGTK:
+	LD	A,[B+]		; Put arguments into temporary buffers 	ACC1 
+	X	A,ACC1L		;					ACC2
+	LD	A,[B]
+	X	A,ACC1H
+
+	LD	B,#ACC2L
+	LD	A,[X+]
+	X	A,[B+]		; ACC2L
+	LD	A,[X]
+	X	A,[B]		; ACC2H
+
+	LD	A,[B]		; ACC2H
+
+	LD	B,#ACC1H
+	IFGT	A,[B]
+	JP	SWAP12
+
+	IFNE	A,[B]
+	JP	XOKB
+XEQB:				; High order bytes are = , test low order bytes
+	LD	A,ACC1L
+	LD	B,#ACC2L
+	IFGT	A,[B]
+	JP	XOKB
+SWAP12:				; Put words into correct order for comparison
+	LD	B,#ACC2H
+	LD	A,[B]
+	X	A,ACC1H		; (ACC1 > ACC2)
+	X	A,[B-]
+
+	LD	A,[B]
+	X	A,ACC1L
+	X	A,[B]
+XOKB:
+	LD	X,#ACC1L
+	LD	B,#ACC2L
+	SC			; Subtract 16 bit values to get difference
+	LD	A,[X]		; ACC1L
+	SUBC	A,[B]
+	X	A,[X+]
+
+	LD	B,#ACC2H
+	LD	A,[X]		; ACC1H
+	SUBC	A,[B]
+	X	A,[X]		; ACC1 <- (ACC1 - ACC2)
+
+	LD	B,#ACC1H
+	LD	A,#H(RejDelta)	; Compare difference to throwaway limit
+	IFGT	A,[B]
+	JP	ACCEPT
+
+	IFNE	A,[B]
+	JP	REJECT
+
+	LD	B,#ACC1L
+	LD	A,#L(RejDelta)	; Test lower bytes if upper bytes are equal
+	IFGT	A,[B]
+ACCEPT:	RETSK		; Return to 2nd instruction after call.
+
+REJECT:	RET		; Normal return
+
+;--------------------------------;
+; Average old and new timer vals.;
+;--------------------------------;
+; X points to old, B points to new
+
+AVERAGE:
+	IFBIT	CTR,GLBFLAGS	; Don't average if in RESET mode
+	JP	NOAV
+
+	RC			; Average old and new timer values
+	LD	A,[X+]		; Add Low bytes -> ACC1L
+	ADC	A,[B]
+	X	A,ACC1L
+	LD	A,[B+]	; (can't auto-increment B in add)
+	LD	A,[X]		; Add High bytes, divide by 2,
+	ADC	A,[B]		; store result in old high byte.
+	RRC	A
+	X	A,[X-]		; (post-decrement X) point back to Low byte
+	LD	A,ACC1L		
+	RRC	A		; Divide low order byte by 2 and store
+	X	A,[X]		; back into old low byte.
+
+	RET
+
+NOAV:
+	LD	A,[B+]		; Copy New directly into Old if reset
+	X	A,[X+]		; mode is on.
+	LD	A,[B]
+	X	A,[X]
+	RET
+
+;--------------------------------;
+; Wait for interrupts            ;
+;--------------------------------;
+Capt4:				; Wait for all three ultrasonic receiver
+				; and flex interrupts
+	IFBIT	1,T2CNTRL	; Test FLEX interrupt pending flag
+	JSR	T2BCAPT		;
+
+	LD	B,#ECHOFLAGS	; (T1 and T2 will time-out)
+	IFBIT	T2FIN,[B]	; T2 timed out ?
+	JP	HALFFIN
+	
+	JSR	HVPULSE		; Keep voltage up...
+
+	JP	Capt4		; Keep looping
+HALFFIN:
+	IFBIT	PE0,WKEDG	; Flex only ?
+	RET
+
+	IFBIT	T1FIN,[B]	; T1 timed out ?
+	RET	
+
+	JP	Capt4		; No - keep waiting
+
+;--------------------------------;
+; Interrupt enables              ;
+;--------------------------------;
+EnT1andT2:			; enable both ultra and flex interrupts
+	SBIT 	4,PSW		; T1ENA
+	SBIT	0,ICNTRL	; T1ENB
+; T2A, T2B never disabled...
+	JP	RESPEN
+EnT2:
+	RBIT	4,PSW		; Disable both T1 interrupts
+	RBIT	0,ICNTRL
+RESPEN:
+; Reset any interrupt pending flags now...
+	RBIT	4,CNTRL		; T1 underflow pending flag
+	RBIT	5,PSW		; T1A capture pending flag
+	RBIT	1,ICNTRL	; T1B capture pending flag
+	LD	B,#T2CNTRL
+	RBIT	4,[B]		; T2 underflow pending flag
+	RBIT	3,[B]		; T2A capture pending flag
+	RBIT	1,[B]		; T2B capture pending flag
+
+	LD	B,#ECHOFLAGS
+	RBIT	T2FIN,[B]	;
+	RBIT	T1FIN,[B]	; Reset period finished flags
+	RET
+	
+;--------------------------------;
+; Transmit ultrasonic pulse...   ;
+;--------------------------------;
+TxPulse:
+
+; Turn on ONE ultrasonic transmitter
+
+	LD	X,#12		; Number of cycles...
+	LD	B,#PORTD	; 
+
+	IFBIT	PE1,WKEDG	; Which transmitter ?
+	JP	TX2NOW
+TX1NOW:
+	SBIT	0,[B]		; 1
+	LD	CREG,#1		; 3
+	LD	CREG,#1		; 3
+TX1L1:
+	DRSZ	CREG		; 3 cycles of NOP
+	JP	TX1L1		; 3
+
+	RBIT	0,[B]		; 1
+	LD	CREG,#1		; 3
+	LD	CREG,#1		; 3 cycles of NOP
+
+	DRSZ	X		; 3
+	JP	TX1NOW		; 3
+
+	JP	TXDLOOP
+TX2NOW:
+	SBIT	1,[B]
+	LD	CREG,#1
+	LD	CREG,#1		; 3 cycles of NOP
+TX2L1:
+	DRSZ	CREG		; 6 cycles of NOP
+	JP	TX2L1
+
+	RBIT	1,[B]
+	LD	CREG,#1		; 3 cycles of NOP
+	LD	CREG,#1		; 3 cycles of NOP
+
+	DRSZ	X
+	JP	TX2NOW
+TXDLOOP:
+	SBIT	GIE,PSW		; Enable interrupts globally
+
+	RET
+
+;--------------------------------;
+; Reset both timers              ;
+;--------------------------------;
+StartPeriod:
+	LD	ECHOFLAGS,#0	; Reset all interrupt flags
+FlexPeriod:
+	RBIT	GIE,PSW		; Disable all interrupts until TX starts
+	LD	TMR1LO,#128	; Adjust timer lo bytes to prevent carry into
+	LD	TMR2LO,#128	; high bytes while setting.
+
+	LD	TMR1HI,#T0HI	; Reset timer 1 countdown value
+	LD	TMR2HI,#T0HI	; Reset timer 2 countdown value
+
+	LD	TMR1LO,#T0LO	; Reset low order bytes as close together
+	LD	TMR2LO,#T0LO	; as possible to avoid errors
+
+	RET
+
+;--------------------------------;
+; Offer data via upload to N.    ;
+;--------------------------------;
+DUMPIT:
+	RBIT	GIE,PSW		; Disable interrupts globally while 
+				; using NintendoOut
+	IFBIT	7,TEMPLATE	; Bit 7 of first byte in template...
+	JP	DMPIT
+
+	JSR	JOYOUT		; Update N.port whether it needs it or not
+	SBIT	GIE,PSW		; Reenable before returning
+	RET
+DMPIT:
+	LD	A,GBASE
+	X	A,X		; Use X as pointer in interrupt
+
+	LD	A,#0A0		; SYNC byte
+	JSR	NintendoOut	; Put a sync byte on the port
+	JSR	INTSOFF		; Disable all ints except G0EDGE and uWIRE
+
+	SBIT	GPDRDY,ICNTRL	; Give the Go Ahead to G0 interrupt routine
+ULLOOP:
+	JSR	HVPULSE		; Keep transmitter supply going...
+
+	IFBIT	GPDRDY,ICNTRL
+	JP	ULLOOP
+ENDUMP:
+	JMP	INTSON
+
+;--------------------------------;
+; Make glove go to sleep         ;
+;--------------------------------;
+SHUTDOWN:
+	RBIT	GIE,PSW		; Turn off all interrupts
+
+	LD	B,#0		; Set up valid RAM flag bytes
+SHUTUP:
+	LD	A,B		; Copy address + 1 to [address]
+	INC	A		; for memory locations 0 - 3
+	X	A,[B+]
+	IFBNE	#4
+	JP	SHUTUP
+SLEEP:
+	SBIT	7,PORTGD	; Set HALT mode flag and wait for RESET.
+	JP	SLEEP		;
+
+;--------------------------------;
+; Average 2 signed 8 bit values  ;
+;--------------------------------;
+; B and X are data pointers
+; Return result in A
+AVERSIGN:
+	LD	A,[X]
+	RLC	A
+	CLR	A
+	IFC
+	LD	A,#0FF
+	X	A,ACC1H		; Extend sign of first byte (X)
+
+	RC			; Add bytes together
+	LD	A,[X]
+	ADC	A,[B]
+	X	A,ACC1L
+
+	CLR	A
+	IFBIT	7,[B]		; Extend sign of 2nd byte
+	LD	A,#0FF
+	ADC	A,ACC1H
+	
+	RRC	A		; Divide upper byte by 2
+	LD	A,ACC1L
+	RRC	A		; Divide lower one by 2
+	
+	RET
+
+;--------------------------------;
+; Interrupt disable/enable       ;
+;--------------------------------;
+INTSON:
+; Reenable interrupts
+	SBIT	4,PSW		; T1ENA
+	LD	B,#ICNTRL
+	SBIT	0,[B]		; T1ENB
+	SBIT	4,[B]		; T0
+	LD	B,#T2CNTRL
+	SBIT	2,[B]		; T2ENA
+
+	RET
+
+INTSOFF:
+; Turn off all interrupts except G0 and microwire
+
+	LD	B,#ICNTRL
+	RBIT	0,[B]		; T1ENB
+	RBIT	4,[B]		; T0
+	LD	B,#T2CNTRL
+	RBIT	2,[B]		; T2ENA
+	LD	B,#PSW
+	RBIT	4,[B]		; T1ENA
+	SBIT	GIE,[B]		; Global interrupt enable.
+	RET
+
+;--------------------------------;
+; Test which set of values to    ;
+; use for XABS or YABS           ;
+;--------------------------------;
+; X is pointer to temporary variables X1ABS,X2ABS or Y1ABS,Y2ABS
+; A = bitmask for HIV & MIV or VIV & MIV
+IFXNVAL:			; Return normally if valid set is not found
+	LD	B,#ACC1L	; RETSK if valid
+	X	A,[B]		; save bitmask
+
+	LD	A,GLBFLAGS
+	OR	A,[B]		; N and Middle = 0 (good data) ?
+	IFEQ	A,ACC1L
+	JP	UX0		; Use tx1 value
+
+	LD	A,ECHOFLAGS	; tx2 value ok ?
+	OR	A,[B]
+	IFNE	A,ACC1L
+	RET			; Can't use either value - return
+
+	LD	A,[X+]		; Get N2 (increment N1 pointer)
+UX0:
+	LD	A,[X]		; Get N1 (or N2 if pointer was incremented)
+	RETSK
+	
+;--------------------------------;
+; Calculate X Y Z coordinates    ;
+;--------------------------------;
+;	: Calculate ultrasonic positions
+;	: Logic interpretation
+;	: etc.
+
+COMPUTE:
+	IFBIT	MODE1,WKEDG	; Is edit mode active?
+	JMP	MAINLOOP	; If so, do not compute anything
+				; (allow editor to use XYZ variables)
+
+			; Dump data now if this is a glove mode program
+	JSR	DUMPIT	; And update N.port whether it needs it or not
+
+; Clear X, Y, Z offsets          ;
+
+RSTOFFS:
+	LD	B,#GLBFLAGS
+
+	IFBIT	CTRX,[B]		; Clear selected offsets
+	LD	XOFS,#0
+
+	IFBIT	CTRY,[B]
+	LD	YOFS,#0
+
+	IFBIT	CTRZ,[B]
+	LD	ZOFS,#0
+
+NROFFS:
+
+; Calculate absolute Z coordinate
+; (Old method: Z = (H1 + M1 + V1) / 128 - 20)
+; New method...
+; Z = [(H1 + H2 + M1 + M2 + V1 + V2) / 256] - 27
+;
+	LD	B,#OldH1L
+	LD	X,#ACC1L
+	LD	A,[B+]
+	X	A,[X+]
+	LD	A,[B]
+	X	A,[X]		; Initialize ACC1 with H1
+
+	LD	B,#OldH2L	; Add H2
+	JSR	ADD16		; ACC1 <- [B] + ACC1
+
+	LD	B,#OldM1L	; Add M1
+	JSR	ADD16		; ACC1 <- [B] + ACC1
+
+	LD	B,#OldM2L	; Add M2
+	JSR	ADD16		; ACC1 <- [B] + ACC1
+
+	LD	B,#OldV1L	; Add V1
+	JSR	ADD16		; ACC1 <- [B] + ACC1
+
+	LD	B,#OldV2L	; Add V2
+	JSR	ADD16		; ACC1 <- [B] + ACC1
+
+; Divide by 256:
+	LD	B,#ACC1H
+	LD	A,[B-]		; Shift ACC1 right 8 times
+
+	X	A,[B]		; (ACC1L)
+	LD	A,[B]
+	X	A,ZNORM		; Save un-offset copy of Z for rotation
+				; (and setting offset in RST_XYZ)
+; Subtract Z offset		; Since Z is always positive, a positive 
+	SC			; offset is also used and is subtracted...
+	LD	A,[B]		; ACC1H:L - 0:ZOFS -> ACC1H:L
+	SUBC	A,ZOFS
+	X	A,[B+]		; 
+
+	CLR	A		; ACC1H
+	SUBC	A,#0
+	X	A,[B]
+
+	JSR	SIGN16		; Limit value in ACC1 to 8 bit signed...
+
+; Update value
+	X	A,ZABS
+;
+; Calculate X and Y coordinates
+;
+	LD	B,#GLBFLAGS	; 
+	LD	X,#ECHOFLAGS
+	LD	A,[X]
+	AND	A,#0E0
+	AND	A,[B]
+	XOR	A,#0E0		; Set bits where either transmitter missed
+				; a receiver.
+	X	A,NYREG		; Use NYREG to hold ANDed status
+; Invert TX1 valid flags
+	LD	A,[B]
+	XOR	A,#0E0
+	X	A,[B]
+; Invert TX2 valid flags
+	LD	A,[X]
+	XOR	A,#0E0
+	X	A,[X]
+
+	LD	A,XOFS
+	X	A,ACC2H		; ACC2H offset is added in GETCOORD
+; X1:				; 2/25/89 position of H receiver switched
+	LD	DREG,#OldM1L	; from right to left.
+	LD	CREG,#OldH1L
+	JSR	GETCOORD
+
+	X	A,X1ABS		; Store new value 
+; X2:
+	LD	DREG,#OldM2L
+	LD	CREG,#OldH2L
+	JSR	GETCOORD
+
+	X	A,X2ABS		; Update value.
+
+	LD	A,YOFS
+	X	A,ACC2H		; ACC2H offset is added in GETCOORD
+; Y1:
+	LD	CREG,#OldV1L
+	LD	DREG,#OldM1L
+	JSR	GETCOORD
+
+	X	A,Y1ABS		; Y1ABS Store new value
+; Y2:
+	LD	CREG,#OldV2L
+	LD	DREG,#OldM2L
+	JSR	GETCOORD
+
+	X	A,Y2ABS		; Update value
+
+	LD	A,NYREG		; Check combined tx/rx miss flags
+	IFNE	A,#0		; All receivers must be valid to get good 
+	JMP	ENDCALC		; rotation
+
+;--------------------------------;
+; Calculate rotation             ;
+;--------------------------------;
+; Put XDIF in ACC1L, YDIF in ACC1H
+; CREG = Rotation threshold - based on absolute Z
+;
+	LD	A,ZNORM		; Add Z compensation for rotation
+	SWAP	A		; ( in NYREG )
+	AND	A,#00F		; average a couple of transmit distances
+				; and scale down.
+				; (divide by 16)
+				; Use look-up table to get fudge factor
+	ADD	A,#L(ZADJTABLE)
+	JSR	LoadIndirect
+	X	A,CREG		; Save adjusted constant in CREG
+
+	LD	B,#ACC2L	; Transfer data to SUBSIGN registers
+	LD	A,X2ABS		; Get delta X
+	X	A,[B+]		; (ACC2L)
+	LD	A,X1ABS
+	X	A,[B]		; (ACC2H)
+
+	JSR	SUBSIGN		; A <- ACC2H - ACC2L (clipped on overflow)
+	X	A,ACC1L		; <- XABS - X2ABS
+
+	LD	B,#ACC2L
+	LD	A,Y2ABS		; Get delta Y
+	X	A,[B+]		; (ACC2L)
+	LD	A,Y1ABS
+	X	A,[B]		; (ACC2H)
+	
+	JSR	SUBSIGN
+	LD	B,#ACC1H
+	X	A,[B-]		; <- YABS - Y2ABS
+
+	LD	X,#0		; X <- 0
+
+	IFBIT	7,[B]		; XDIF < 0 ?	;7,ACC1L
+	SBIT	0,X		; X <- X .or. 1
+
+	LD	B,#ACC1H
+	IFBIT	7,[B]		; YDIF < 0 ?
+	SBIT	1,X		; X <- X .or. 2
+
+; MAJOR QUADRANT = DREG
+; Multiply index X by 3 (DREG <- X + (2*X) )
+	LD	A,X
+	RC
+	RLC	A
+	ADD	A,X
+	X	A,DREG
+
+; Quadrants 0 and 3 must use difference of deltaX and deltaY,
+; quadrants 1 and 2 use SUM of deltaX and deltaY.
+
+	LD	A,X
+	IFEQ	A,#0
+	JP	NORMROT
+
+	IFEQ	A,#3
+	JP	NORMROT
+
+; Change sign of delta Y (ACC1H)
+	LD	B,#ACC1H
+	LD	A,[B]
+	JSR	NEGACC		;	XOR	A,#0FF
+				;	INC	A
+	X	A,[B]
+
+NORMROT:
+; Subdivide quadrant into three further ranges
+	LD	X,#2
+
+	LD	B,#ACC1H
+	LD	A,[B+]		; (ACC1H)
+	X	A,[B+]		; (ACC2L)
+	LD	A,ACC1L		; XDIF - YDIF < constant ?
+	X	A,[B]		; (ACC2H)
+	JSR	SUBSIGN		; Subtract: A <- ACC2H - ACC2L
+
+	RLC	A		; Check sign of A
+	IFNC	
+	JP	GOPOS
+GONEG:
+	RRC	A		; Fix A before continuing
+	XOR	A,#0FF		; Change sign
+	INC	A		; constant = -constant
+	LD	X,#0
+	JP	TEA
+GOPOS:
+	RRC	A		; Fix A before continuing
+TEA:
+	IFGT	A,CREG		; ABS(XDIF - YDIF) > constant ?
+	JP	NOELSE
+
+	LD	X,#1		; 	
+NOELSE:
+	LD	A,X
+	ADD	A,DREG
+LT12:
+	IFGT	A,#11
+	JP	MOD12
+	ADD	A,#L(QTABLE)	; Look up rotation from table
+	JSR	LoadIndirect	; and save.
+	X	A,ROTATION 
+	JP	ENDCALC
+MOD12:
+	SC
+	SUBC	A,#12
+	JP	LT12
+
+ENDCALC:
+	SBIT	PERR,ECHOFLAGS	; Flag used by RESET routines to tell
+				; that a pulse was not received.
+				; If valid X and Y are both found, clear PERR
+; Calculate averaged X, Y: 
+
+	LD	B,#NYREG
+	RBIT	0,[B]
+	RBIT	1,[B]
+
+	IFBIT	MIV,[B]
+	JP	NOAVXY		; Don't average unless both middle distances
+				; are valid
+	IFBIT	HIV,[B]		
+	JP	NOAVX
+; X:
+	SBIT	0,NYREG		; Set bit showing X has been updated
+
+	LD	B,#X1ABS
+	LD	X,#X2ABS
+	JSR	AVERSIGN	; Average two signed 8 bit numbers
+	X	A,XABS
+NOAVX:
+	IFBIT	VIV,NYREG
+	JP	NOAVXY
+; Y:
+	SBIT	1,NYREG		; Set bit showing Y has been updated
+
+	LD	B,#Y1ABS
+	LD	X,#Y2ABS
+	JSR	AVERSIGN	; Average two signed 8 bit numbers
+	X	A,YABS
+NOAVXY:
+	IFBIT	0,NYREG
+	JP	XISOK
+
+	LD	X,#X1ABS	; Flag for X
+	LD	A,#09F		; Bitmask for HIV,MIV bits
+	JSR	IFXNVAL
+	JP	XISOK
+
+	X	A,XABS
+	SBIT	0,NYREG
+XISOK:
+	IFBIT	1,NYREG
+	JP	YISOK		; If Y coudn't be averaged, choose
+				; either Y1 or Y2
+	LD	X,#Y1ABS	; Flag for Y
+	LD	A,#03F		; Bitmask for VIV,MIV bits
+	JSR	IFXNVAL
+	JP	YISOK
+
+	X	A,YABS
+	SBIT	1,NYREG
+YISOK:
+	LD	A,NYREG		; Set error flag for Center routine
+	AND	A,#003		; if either X or Y was not updated
+	IFEQ	A,#003
+	RBIT	PERR,ECHOFLAGS
+;
+; Determine dominant vector of X, Y & Z:
+; DOMVEC = 00 if X, 01 if Y, 10 if Z.
+;
+	LD	DOMVEC,#3	; Null value
+	LD	CREG,#3		; Loop counter
+	LD	X,#ZABSOLD	; Variable to compare + 1
+	LD	B,#ACC1H	; Keep max value here
+	CLR	A
+	X	A,[B]		; Clear max, set pointer to ACC1L
+MXLUP:
+	LD	A,[X-]		; (just an autodecrement)
+	LD	A,[X-]		; Get variable to compare
+	JSR	ABSACC		; Look only at absolute value of A
+	IFGT	A,[B]		; if greater, replace max 
+	JP	NEWMAX
+
+	JP	NXMAX
+NEWMAX:
+	X	A,[B]		; Put new max value away
+	LD	A,CREG		;				0=X
+	DEC	A		; CREG - 1 = {0 - 2}		1=Y
+	X	A,DOMVEC	; Save dominant vector number	2=Z
+NXMAX:
+	DRSZ	CREG		; Go through loop three times
+	JP	MXLUP
+;
+	IFBIT	CTR,GLBFLAGS	; RESET (CENTER) mode flag ?
+	JSR	RSTXYZ		; Set new offsets and clear flag unless PERR
+
+	RBIT	PERR,ECHOFLAGS	; Clear RESET error flag
+
+	IFBIT	CTR,GLBFLAGS
+	JMP	MAINLOOP	; Don't Process data until reset is complete
+				; (return from COMPUTE subroutine)
+
+;--------------------------------;
+; Gesture recognition            ;
+;--------------------------------;
+GESTURE:			; Set template address to first gesture
+	LD	GADDR,#TEMPLATE+1
+
+; Set up for scanning gesture definitions
+; Get number of gestures:
+	LD	A,TEMPLATE+0
+	AND	A,#00F		; Mask unused bits
+
+	IFEQ	A,#0
+	JMP	LOGIC		; If there are no gestures, go to logic
+				; section.
+	X	A,NYREG		; Use NYREG as gesture counter
+
+	LD	GNUM,#1		; Use GNUM as current gesture number
+
+GSTLOOP:			; Gesture loop 
+	LD	A,GADDR
+	PUSH	A
+	X	A,B		; Data pointer in B = gesture header byte
+	POP	A
+	INC	A
+	X	A,X		; Data pointer in X = gesture data byte
+
+	LD	A,[B]		; Read gesture type:
+
+	AND	A,#03F		; (ignore Last state and 1 shot bits)
+	IFEQ	A,#0		; Gesture header of 00 = no-operation
+	JMP	NextGesture	; this will follow a relative gesture
+; (A gesture type 00 would be flex with no fingers set in the bitmap)
+
+				;		00 = FLEX
+	AND	A,#03		;		01 = POSITION
+	IFEQ	A,#0		;		10 = ORIENTATION
+	JMP	GFLEX		;		11 = D. POSITION
+
+	IFEQ	A,#2
+	JMP	GORIENT
+
+; Equates for position gestures to make things more clear
+
+	LAST	=	ACC1L
+	CMT	=	ACC1H
+	TURN	=	ACC2L
+	CURR	=	ACC2H
+
+GPOSITION:
+; Load the appropriate vector current value into LAST
+;
+	LD	A,[X]		; Check vector direction
+	RLC	A		; Multiply by 2
+	AND	A,#06		; 00 = X, 01 = Y, 10 = Z, 11 = don't care
+	ADD	A,#XABS		; Add base address
+	X	A,B
+	LD	A,[B+]
+	X	A,CURR		; Store the vector in CURR (current position)
+	LD	A,[B]
+	X	A,LAST		; Store the Old vector value in LAST
+
+	JSR	GADB		; Data pointer in B = gesture header byte
+
+	IFBIT	REL,[B]		; Relative position gesture ?
+	JMP	RELATIVE
+
+; Absolute position gesture:
+; If sign of current position is different from gesture polarity,
+; the gesture automatically becomes false.
+
+	LD	A,[X]		; Look at the gesture Vector direction
+	SWAP	A
+	RLC	A		; Move bit into MSB position to match 
+				; current V
+	XOR	A,CURR		; Compare sign with current Vector value
+	AND	A,#080		; Leave only the sign bit mismatch status
+	IFEQ	A,#080
+	JP	CG4		; Reset gesture
+
+; Continue evaluating absolute position gesture...
+	LD	B,#CURR
+	LD	A,[B]
+	JSR	ABSACC		; Take the absolute value of A
+	X	A,[B]
+
+	LD	A,[X]		; Look at SET distance
+	RRC	A
+	RRC	A		; make a 6 bit value
+	AND	A,#03E
+
+	IFGT	A,[B]		; If SET > CURR,
+CG4:
+	JMP	ClrGesture	; clear gesture
+
+; Current vector value is > set value.
+SetPosition:
+	JSR	GADB
+	IFBIT	1,[B]		; Is this a vector dominant gesture ?
+	JP	VDTYPE		;     (absolute only) (??)
+
+	JP	NG6
+
+; Vector dominant position:
+; Gesture can only BECOME true if the vector is the largest
+; of the three vectors (X, Y, Z), AND the gesture is currently false.
+; If vector is NOT dominant, it will not become true.
+;
+VDTYPE:
+	LD	A,[X]		; Check this gesture's vector (X, Y or Z)
+	AND	A,#03		; Mask unneeded bits
+	IFNE	A,DOMVEC	; Does the vector type match the dominant one ?
+	JMP	NextGesture	; Do nothing if no match.
+NG6:
+	JMP	SetGesture
+
+; Relative position Gesture
+;
+RELATIVE:
+; Current (C) is in CURR
+; Put turning point (T) in TURN
+; Calculate current - turning point (C - T); put in CMT
+; Last (L) is in LAST
+
+	LD	A,[X]		; Get vector number (X, Y or Z)
+	AND	A,#03
+	ADD	A,#TURNX	; Get turning point address
+	X	A,B
+	LD	A,[B]		; Read turning point
+	X	A,TURN
+
+; Subtract turning point from current - clip on overflow
+
+	JSR	SUBSIGN		; A <- CURR - TURN
+	X	A,CMT
+
+	JSR	GADB		; Get B pointer to header byte
+	LD	A,[B]		; Get RESET value in CREG
+	RRC	A		; Shift once
+	AND	A,#01C		; Keep 5 bit magnitude, 3 bit resolution
+	X	A,CREG		; Store RESET value in CREG
+
+; Depending on current state of gesture, go to RFALSE, PTRUE, or NTRUE.
+; (Current state requires two bits - 0, +1, -1)
+
+; On or Off state ?
+
+	IFBIT	7,[B]		; (last state +)
+	JMP	PTRUE		; Test current (positive) state of gesture
+
+	LD	A,[B+]
+	LD	A,[B+]		; Increment B to next gesture
+
+	IFBIT	7,[B]		; Test current (negative) state of next 
+	JMP	NTRUE		; gesture in template (relative gestures
+				; take two spaces in the template).
+RFALSE:
+; Current gesture state is false (0):
+; Set gesture to true+ if (C - T) >= SET
+; Set gesture to true- if (T - C) >= SET
+;
+	LD	B,#CMT
+
+	LD	A,[X]		; Get SET value
+	RRC	A
+	RRC	A		; Adjust to 6 bit value (ls bit = 0)
+	AND	A,#03E		
+	X	A,CREG		; Save SET in CREG
+	
+	IFBIT	7,[B]		; (Current - turning point) = negative ?
+	JP	NSET
+
+	LD	A,CREG
+	IFGT	A,[B]		; SET < (C - T)  ?
+	JP	NOCHG	
+
+; Set new state to +TRUE
+	JSR	UDLAST		; Update LAST
+;;;	JMP	SetGesture	; Set +TRUE flag
+	JMP	SetPosition	; (include check for dominant vector)
+NSET:
+	LD	A,[B]		; (CMT)
+	XOR	A,#0FF
+	INC	A		; Change sign of (C - P) -> (P - C)
+	X	A,[B]
+
+	LD	A,CREG
+	IFGT	A,[B]
+	JP	NOCHG	
+; Set new state to -TRUE
+	JSR	UDLAST		; Update last Value
+
+	JSR	NGINC		; Increment gesture pointers
+	JP	NZNY1
+
+	LD	NYREG,#1	; If NYREG is decremented to zero,
+				; set it to 1 so zero will be detected
+NZNY1:				; at the next real NGINC.
+;;	JMP	SetGesture	; Set -TRUE flag (in NEXT gesture)
+	JMP	SetPosition	; (include check for dominant vector)
+NOCHG:
+	JSR	UDLAST
+	JMP	NextGesture	
+
+; Current gesture state is -TRUE (true in the negative direction).
+; Reset turning point if (C > L) .and. (T > L)
+; Set gesture to false and reset turning point if (C - T) >= RESET
+;
+NTRUE:
+	LD	B,#LAST		; B points to Last
+	LD	A,CURR		; A = Current
+
+	JSR	IFGTAB		; IF C > L...
+	JP	P1TRU
+NPART2:
+	LD	A,CREG		; A = RESET	
+	LD	B,#CMT		; [B] = (C - T)
+	JSR	IFGTAB		; Compare: IF RESET > (C - T)...
+	JP	NOCHG
+ 	
+; Set new state to false
+; reset turning point	
+
+XClrGesture:
+	JSR	GADB
+	RBIT	7,[B]		; Clear last state bit
+
+	JSR	GESTBIT		; Locate correct bit mask for [B] in A.
+	XOR	A,#0FF
+	AND	A,[B]
+	X	A,[B]		; Clear the first bit (+)
+
+	JSR	LASTTURN	; Copy last value to turning point
+
+	JSR	UDLAST		; Copy CURR to LAST
+
+	JSR	NGINC		; Increment gesture pointers
+	JP	NZNY2
+
+	LD	NYREG,#1	; If NYREG is decremented to zero,
+				; set it to 1 so zero will be detected
+NZNY2:				; at the next real NGINC.
+	JMP	ClrGesture	; (of second gesture entry (-))
+P1TRU:
+	LD	A,TURN
+	LD	B,#LAST
+	JSR	IFGTAB		; TURN > LAST ?
+	JSR	LASTTURN	; Set turning point = last
+	
+	JMP	NPART2
+
+; Current gesture state is +TRUE (true in the positive direction).
+; Reset turning point if (C < L) .and. (T < L)
+; Set gesture to false and reset turning point if (T - C) >= RESET
+;
+PTRUE:		
+	LD	B,#CURR		; B points to Current
+	LD	A,LAST		; A = Last
+
+	JSR	IFGTAB		; IF L > C...
+	JP	P2TRU
+PPART2:
+	LD	A,CMT
+	XOR	A,#0FF
+	INC	A
+	X	A,CMT		; Complement CMT (TURN - CURR)
+
+	LD	A,CREG		; A = RESET	
+	LD	B,#CMT		; [B] = (T - C)
+	JSR	IFGTAB		; Compare: IF RESET > (T - C)...
+	JMP	NOCHG
+ 	
+	JMP	XClrGesture
+P2TRU:
+	LD	A,LAST
+	LD	B,#TURN
+	JSR	IFGTAB		; LAST > TURN ?
+	JSR	LASTTURN	; Set turning point = last
+	
+	JP	PPART2
+
+LASTTURN:			; Copy last value to turning point
+	LD	A,[X]		; Look at vector number
+	AND	A,#03
+	ADD	A,#TURNX	; Turning point 
+	X	A,B
+	LD	A,LAST
+	X	A,[B]
+
+	RET
+
+UDLAST:		; Update last position
+	LD	A,[X]	; Get vector number
+	RLC	A	; x 2
+	AND	A,#06
+	ADD	A,#XABS
+	X	A,B
+
+	LD	A,[B+]	; Get current value
+	X	A,[B]	; Store as last value
+
+	RET
+
+;
+; Flex gesture Header byte:
+;             <-- second finger  <-- first finger <--
+; Last	/1 shot	/THUMB	/INDEX	/MIDDLE	/RING	/ 0	/ 0	;
+;
+; Data byte - Set bitmap:  2nd finger / first finger
+;  3	/  2	/  1	/  0	/  3	/  2	/  1	/  0	/
+;
+; Finger map specifies 1 or 2 fingers.  If both are true,
+; gesture becomes true.  If either are false, gesture becomes false.
+ 
+GFLEX:
+	LD	A,[B]		; Gesture finger map
+	RRC	A
+	RRC	A
+	X	A,ACC1L		; Finger Map
+
+	LD	B,#ACC2H	; Truth accumulator (use bit 0)
+	RBIT	0,[B]		; Truth accumulator = 0 to start.
+				; If either finger is false, entire gesture
+				; becomes false
+	RBIT	1,[B]		; Indicate 1st set of set/ reset values 
+	
+	LD	A,FLEXMAP
+	X	A,ACC1H		; Current flex values
+
+	LD	CREG,#4
+SCANFING:
+	LD	B,#ACC1L	; Finger Map
+	LD	A,[B]		; Scan finger map
+	RRC	A		; Shift lsb into Carry
+	X	A,[B+]		; store shifted value back in ACC1L
+
+	IFC			; Process finger if bit in map is set
+	JP	FINGSET	
+FINGSCAN:	
+	LD	B,#ACC1H	; Current Flex (selected finger in bits 0,1)
+	LD	A,[B]		; Move next finger into lsb position (ACC1H)
+	RRC	A
+	RRC	A
+	X	A,[B]		; Update this copy of the current flex values
+
+	DRSZ	CREG		; Do until 4th finger has been checked
+	JP	SCANFING
+
+	LD	B,#ACC2H
+	IFBIT	0,[B]		; Gesture true ?
+	JMP	SetGesture	; One or both fingers were true
+
+	JP	CGEST1		; No bits were set in gesture header map
+
+FINGSET:
+; Check current (2 bit) value against SET Bitmap	
+
+	LD	A,[B+]		; Get Current Flex value (ACC1H)
+	AND	A,#03
+	ADD	A,#L(BITMASK)	; Get bit 0 - 3 to AND with bitmap
+	JSR	LoadIndirect
+
+	X	A,[B+]		; Save mask value in ACC2L
+	
+	LD	A,[X]		; Get set, reset values from template
+	IFBIT	1,[B]		; First finger tested already ? (ACC2H)
+	SWAP	A		; If second finger in gesture, swap S/R values
+
+	SBIT	1,[B]		; Set alternate nybble flag
+
+	AND	A,ACC2L		; AND with bitmask based on flex value
+	IFEQ	A,#0
+CGEST1:	JP	ClrGesture	; First false finger clears entire gesture
+
+	SBIT	0,[B]		; Set true bit (ACC2H)
+	JP	FINGSCAN	; Continue scanning
+	
+; Orientation gesture Header byte:
+;
+; Last	/1 shot	/	/	/	/	/ 1	/ 0	;
+;
+; Data byte:
+;
+; End position 			/ Start position 		;
+;
+GORIENT:
+	LD	A,[X]		; Get Start AND end positions
+				; (gesture is true when current rotation falls
+	LD	B,#ACC1L	; between start and end (counting clockwise))
+	AND	A,#00F
+	X	A,[B]		; Put start in ACC1L
+
+	LD	A,[X]
+	SWAP	A
+	AND	A,#00F		; end in A
+
+	IFGT	A,[B]		; if END > START,
+	JP	ORAND		; S <- (R > START) .and. (R < END)
+OROR:			
+	IFGT	A,ROTATION	; Otherwise,
+	JP	SetGesture	; S <- (R > START) .or. (R < END)
+TestStart:
+	LD	A,ROTATION
+	IFGT	A,[B]
+	JP	SetGesture
+
+	JP	ClrGesture
+ORAND:
+	IFGT	A,ROTATION
+	JP	TestStart
+
+;-- -- -- -- -- -- -- -- -- -- --;
+; Include One-Shot checking here
+;
+ClrGesture:
+	JSR	GADB		; Restore B pointer to gesture header
+	RBIT	7,[B]		; Update state history in bit 7 of template 
+DO1SHOT:			; gesture header.
+	JSR	GESTBIT		; Locate correct bit mask for [B] in A.
+	XOR	A,#0FF
+	AND	A,[B]
+	X	A,[B]
+	JP	NextG1
+SetGesture:
+	JSR	IF1SHOT		; (conditional ret/retsk)
+	JP	DO1SHOT
+SetIt:
+	SBIT	7,[B]		; Update state history
+
+	JSR	GESTBIT
+	OR	A,[B]
+	X	A,[B]	
+	JP	NextG1
+
+NextGesture:
+	JSR	IF1SHOT
+	JP	DO1SHOT
+NextG1:
+	JSR	NGINC		; Increment gesture pointers
+	JMP	GSTLOOP		; Continue evaluating gestures until 
+				; all are finished.  ( JMP will be skipped)
+	JP	LOGIC
+
+;--------------------------------;
+; Test for 1 shot - clear state  ;
+;--------------------------------;
+IF1SHOT:
+	JSR	GADB		; Restore B pointer to gesture header
+	IFBIT	7,[B]		; Look at previous state of this gesture
+	JP	CK1SHOT		; If it was true last time, check for 1 shot
+
+	RETSK			; If it is already false, do nothing
+
+CK1SHOT:			; Handle One-Shot gesture
+	IFBIT	6,[B]		; Is this a one shot gesture ?
+	RET			; If so, clear bit without clearing
+				; state history
+	RETSK			; If not, go on as normal.
+	
+;--------------------------------;
+; Gesture logic                  ;
+;--------------------------------;
+LOGIC:
+
+	IFBIT	7,TEMPLATE	; Is this a glove mode program ?
+	JMP	MAINLOOP		; Return from COMPUTE subroutine
+
+; Parse logic statements and evaluate
+; GADDR = Address of current logic statement
+; CREG = Indent level (0 - 15)
+; COUNT = Number of logic statements
+; STATE = array (4 bytes) used for parsing - holds state of each indent
+; 	level.
+
+	LD	B,#ACC1H	
+	LD	[B+],#0FF	; Nintendo port accumulator ACC1H
+	LD	[B+],#0		; Pulse 1 mask accumulator  ACC2L
+	LD	[B],#0		; Pulse 2 mask accumulator  ACC2H
+
+	LD	B,#WKEDG
+	RBIT	BLIPFL,[B]
+
+; INITIALIZE LOGIC INDENT STATE AND TRUTH TABLES
+
+	LD	STATE,#01	; Set indent state (0) to true, (1-7) = false
+	LD	CREG,#0		; Indent count
+	SBIT 	INDT,[B]	; SET INDENT FLAG (TRUE)
+
+	JSR	GADB		; GADDR should be pointing at logic header
+	LD	A,[B]		; Get logic statement count
+
+	AND	A,#07F		; Ignore bit 7
+
+	IFGT	A,#TEMPSIZE-2
+	LD	A,#1		; If logic count is bad, limit weird results
+
+	X	A,COUNT		; Put logic byte count in COUNT
+
+	JSR	INCGAD		; Move pointer to first logic byte
+
+LTEST:
+	LD	A,COUNT
+	IFNE	A,#0		; Test for end of process
+	JP	PARSE		; 
+
+	JMP	ENDLOG
+
+; HERE TO PARSE LOGIC BYTE
+
+PARSE:
+	LD	A,GADDR
+	X	A,X
+	LD	A,[X]		; Get new logic byte
+	SWAP	A		; Put logic type in low nybble
+	AND	A,#00F		; and mask other for now
+
+	IFGT	A,#07		; Action statement ?
+	JMP	LACTION
+
+	ADD	A,#L(LOGJMP)
+	JID
+LOGJMP:			; Logic statement jump table
+	.BYTE	L(LTMPN)	; 0
+	.BYTE	L(LIFG)		; 1
+	.BYTE	L(LTIFG)	; 2
+	.BYTE	L(LEIFG)	; 3
+	.BYTE	L(LANDG)	; 4
+	.BYTE	L(LORG)		; 5
+	.BYTE	L(LENDIF)	; 6
+	.BYTE	L(LELSEDO)	; 7
+;
+; "ELSE DO"
+; pre-decrement the indent level, set current state,
+; post-increment the level and set the indent flag.
+;
+LELSEDO:
+	JSR	DECLEV		; BACK UP ONE LEVEL
+
+	JSR	PREVLOG		; GET THE STATE OF THE LEVEL BEHIND US
+	X	A,[B]		; SAVE TEMPORARILY
+
+	JSR	CURLOG		; GET THE CURRENT STATE
+	XOR	A,#0FF		; INVERT
+	AND	A,[B]		; COMBINE THE TWO
+
+	JSR	WRST		; BECOMES THE NEW STATE
+
+	JSR	INCREG		; UP TO THE NEXT LEVEL
+	SBIT 	INDT,WKEDG	; FLAG to show WE'VE INDENTED ALREADY
+
+	JP	EACT1
+
+;
+; "ENDIF"
+; decrements the indent level
+;
+LENDIF:
+	JSR	DECLEV	; BACK UP ONE LEVEL
+EACT1:
+	JMP	EndAction
+
+;
+; "THEN IF (G)"
+; increments the indent level if the indent flag
+; is clear and then performs an IF (G)
+;
+
+LTIFG:
+	JSR	IFINCLEV	; INCREMENT INDENT LEVEL IF FLAG IS CLEAR
+	JP	LIFG1
+
+;
+; "IF (G)"
+; evaluates the state of gesture G and sets the state
+; of the current indent level accordingly if the state of the
+; previous indent level is true.
+;
+LIFG:
+	JSR	DECLEV		; BACK UP A LEVEL
+
+LIFG1:
+	RBIT 	INDT,WKEDG	; CLEAR THE INDENT LEVEL FLAG
+
+	JSR	EVAL		; Evaluate gesture - return in A: 0 or FF
+	X	A,[B]
+
+	JSR	PREVLOG		; READ STATE (INDENT-1)
+	AND	A,[B]		; And with current state
+
+	JMP	WSLOOP
+;
+; "ELSE IF (G)"
+; decrements the indent level and clears the indent flag.
+;
+LEIFG:
+	JSR	DECLEV		; BACK UP A LEVEL
+	RBIT 	INDT,WKEDG	; CLEAR THE INDENT FLAG
+
+	JSR	EVAL		; Evaluate gesture - return in A: 0 or FF
+	X	A,[B]
+
+	JSR	CURLOG	; GET CURRENT SETTING
+	XOR	A,#0FF		; INVERT
+	AND	A,[B]		; COMBINE
+	X	A,[B]		; ...
+
+	JSR	PREVLOG	; GET PREVIOUS LOGIC SETTING
+	AND	A,[B]	; COMBINE WITH PREVIOUS ONES
+
+	JP	WSLOOP
+;
+; "AND (G)"
+; evaluate the state of gesture G and perform a logical
+; AND with the state of the current indent level
+;
+LANDG:
+	JSR	IFDECLEV	; BACK UP ACCORDING TO STATE OF INDENT FLAG
+	RBIT	INDT,WKEDG	; CLEAR INDENT FLAG
+
+	JSR	EVAL		; Evaluate gesture - return in A: 0 or FF
+	X	A,[B]
+
+	JSR	CURLOG	; READ STATE (INDENT)
+	AND	A,[B]		; AND with gesture evaluation
+	JP	LORG1		; BRANCH TO COMMON CODE
+
+;
+; "OR (G)"
+; evaluate the state of gesture G and perform a logical
+; OR with the state of the current indent level
+;
+LORG:
+	JSR	IFDECLEV	; BACK UP ACCORDING TO INDENT FLAG
+	RBIT 	INDT,WKEDG	; CLEAR INDENT FLAG
+
+	JSR	EVAL		; Evaluate gesture - return in A: 0 or FF
+	X	A,[B]
+
+	JSR	CURLOG	; READ STATE (INDENT)
+	OR	A,[B]		; OR with gesture evaluation
+LORG1:	X	A,[B]
+
+	JSR	PREVLOG		; READ STATE [INDENT-1]
+	AND	A,[B]		; AND with other states
+WSLOOP:
+	JSR	WRST		; Write state(indent)
+	JMP	EndAction
+
+; Load template N now, then restart.
+LTMPN:
+	LD	A,[X]		; Get logic byte again
+	AND	A,#00F		; and separate action reference
+	INC	A		; Range of legal template numbers is:
+	JSR	LoadATemplate	; 1 - 16 (spec as 0 - 15 in logic byte)
+
+	LD	COUNT,#1	; Abort logic processing if new template 
+	JMP	RALL		; has been loaded.
+;
+LACTION:
+	IFGT	A,#00B		; ELSE group ?
+	JP	LELSE
+;
+; THEN group.
+;
+	JSR	IFINCLEV	; INCREMENT LEVEL IF FLAG IS CLEAR
+	SBIT	INDT,WKEDG	; SET INDENT FLAG
+
+	JSR	PREVLOG		; GET PREVIOUS T/F
+	IFEQ	A,#0		; Do action if status is true
+	JP	EACT2
+
+	JP	DoAction
+;
+; ELSE group.
+;
+LELSE:
+	JSR	DECLEV		; DECREMENT LEVEL
+
+	JSR	PREVLOG		; GET T/F OF NEXT LOWER LEVEL
+	X	A,[B]		; SAVE STATE
+
+	JSR	CURLOG		; GET T/F OF THIS LEVEL
+	XOR	A,#0FF		; invert it
+	AND	A,[B]		; COMBINE
+
+	IFEQ	A,#0
+EACT2:	JP	EACT3		; Do action if status is false
+
+DoAction:
+	LD	A,[X]		; Get logic byte again
+	AND	A,#0B0
+	IFEQ	A,#0B0		; Match Bx or Fx ?
+	JP	INVG
+
+	LD	A,[X]		; Get logic byte again
+	AND	A,#00F		; and separate action reference
+
+	IFNE	A,#0		; 0 = Beep
+	JP	NOTBEEP
+
+	SBIT	BLIPFL,WKEDG	; Set flag so blip will happen at end of logic
+EACT3:
+	JP	EACT4X
+INVG:			; Do invert-gesture type action
+	LD	A,[X]
+	AND	A,#00F		; Get gesture number to invert...
+	JSR	AGBIT		; Locate correct bit and byte to invert
+	XOR	A,[B]
+	X	A,[B]		; Then invert it
+EACT4X:
+	JMP	EndAction		; 
+
+NOTBEEP:
+	IFGT	A,#8		; Special action ?
+	JMP	DoSpecial	; CONT/PULSE = don't care
+
+; Special case for A,B buttons - swap if flag is set...
+	IFBIT	5,PUL2RATE	; Check AB swap flag
+	JP	ABSWAP
+	JP	NOABSWAP
+ABSWAP:
+	IFEQ	A,#7		; B button ?
+	JP	BSWAP
+
+	IFEQ	A,#8		; A button ?
+	LD	A,#7
+
+	JP	NOABSWAP
+BSWAP:
+	LD	A,#8
+;
+NOABSWAP:
+; Get Nintendo port bit for selected action	
+	ADD	A,#L(BITMASK-1)	; (offset -1 for A=1 to 8)
+	JSR	LoadIndirect	; (in A)
+	PUSH	A		; Save Nintendo bit on stack
+
+	LD	A,[X]		; Get logic byte again
+	AND	A,#030		; and check action type
+
+	IFEQ	A,#0		; Continuous action ?
+	JP	DOCONT		
+
+	LD	X,#PUL2RATE
+
+	IFEQ	A,#020		; Pulsed 2 action ?
+	JP	DOP2
+
+	DRSZ	X		;(never 0) Move X to PUL1RATE
+
+	IFEQ	A,#010		; Pulsed 1 action ?
+	JP	DOP1
+
+	POP	A		; Fix stack
+EACT4:
+	JP	EACT5		; 
+
+DOP1:	
+	LD	B,#PUL1MASK	; Check last state of mask
+	POP	A		; Get bitmask in A
+	PUSH	A
+	JSR	CLSTATE		; If it was 0 last time, reset phase and
+				; timer count.
+	LD	B,#ACC2L
+	JP	DOPX
+DOP2:	
+	LD	B,#PUL2MASK	; Check last state of mask
+	POP	A		; Get bitmask in A
+	PUSH	A
+	JSR	CLSTATE		; If it was 0 last time, reset phase and
+				; timer count.
+	LD	B,#ACC2H
+DOPX:
+	POP	A		; Set bit in pulse 2 mask buffer
+	PUSH	A
+	OR	A,[B]
+	X	A,[B]
+DOCONT:	
+	POP	A
+	XOR	A,#0FF		; Invert (for ANDing with negative logic)
+	LD	B,#ACC1H
+	AND	A,[B]		; Set bit in port buffer buffer
+	X	A,[B]
+EACT5:
+	JP	EACT6
+
+;- Some subroutines -;
+WRST:				; Write A to status(indent)
+	IFNE	A,#0
+	JP	SETST
+CLRST:
+	JSR	STATCB		; Get bit and B pointer
+	XOR	A,#0FF		; Invert bitmask
+	AND	A,[B]		; Clear selected bit
+	JP	SETSET
+SETST:
+	JSR	STATCB
+	OR	A,[B]		; Set bit
+SETSET:
+	X	A,[B]		; Put modified byte back in array
+	RET
+;- End of some subroutines -:
+
+DoSpecial:			; (8 < A < 16)
+	ADD	A,#L(SPECJP-9)
+	JID
+SPECJP:				; Jump table for special actions
+	.BYTE	L(EndAction)	; 9
+	.BYTE	L(CTR1CE)	; 10
+	.BYTE	L(CentAll)	; 11
+	.BYTE	L(CentX)	; 12
+	.BYTE	L(CentY)	; 13
+	.BYTE	L(CentZ)	; 14
+	.BYTE	L(ResAct)	; 15
+
+CTR1CE:		; Center Once 
+	IFBIT	CTRDONCE,GLBFLAGS
+EACT6:	JP	EndAction		; Don't do if its been done before
+
+	JP	CentAll
+
+ResAct:		; Reset (flex, center once flag, beep)
+	SBIT	BLIPFL,WKEDG		; Set flag so blip will happen at
+RALL:					; end of logic interpretation
+	JSR	RSTFLEX			; Reset flex mins and maxes,
+	RBIT	CTRDONCE,GLBFLAGS	; clear centered once flag,
+					; and center once always
+CentAll:
+	LD	A,#CAMASK	; Constant with X,Y and Z bits set
+	JP	CentSomething
+CentX:
+	LD	A,#CXMASK
+	JP	CentSomething
+CentY:
+	LD	A,#CYMASK
+	JP	CentSomething
+CentZ:
+	LD	A,#CZMASK
+CentSomething:
+	LD	B,#GLBFLAGS
+	OR	A,[B]		; OR bits to be set with current status
+	X	A,[B]		; and update flag register
+
+EndAction:
+	JSR	INCGAD		; Increment GADDR
+
+	DRSZ	COUNT		; Decrement number of bytes to process
+	JMP	LTEST		; and go back to the top
+
+; HERE WHEN LOGIC IS DONE
+
+ENDLOG:
+	IFBIT	BLIPFL,WKEDG	; Blip command during process ?
+	JSR	BLIP
+
+	RBIT	BLIPFL,WKEDG
+
+	LD	B,#ACC1H	; (ACC1H,ACC2L,ACC2H are sequential in mem)
+
+	LD	A,[B+]		; ACC1H
+	X	A,NPORT		; Copy accumulator into NPORT at the end.
+
+	LD	A,[B+]		; ACC2L
+	X	A,PUL1MASK	; Copy pulse mask accumulators into mask 1
+
+	LD	A,[B]		; ACC2H
+	X	A,PUL2MASK	; Copy pulse mask accumulators into mask 2
+
+	JMP	MAINLOOP	; Return point for COMPUTE
+
+;--------------------------------;
+; Subroutines:                   ;
+;--------------------------------;
+;
+EVAL:		; Evaluate state of gesture and return 0 (false) or FF (true)
+	LD	A,[X]		; Look at logic byte
+	AND	A,#00F		; Isolate gesture number in A (1-15)
+	JSR	AGBIT		; Locate bit of interest
+	JP	TORF		; Return true of false
+
+CURLOG:
+;	RETURN THE T/F OF THE CURRENT LOGIC LEVEL
+;
+	LD	A,CREG	; GET CURRENT LEVEL
+	JP	RDSTX	; JOIN COMMON CODE
+
+PREVLOG:
+;	RETURN THE T/F OF THE PREVIOUS LOGIC LEVEL
+;	(and return B=#ACC1L)
+	LD	A,CREG		; GET THE CURRENT LEVEL
+	IFEQ	A,#0		; IF IT IS ALREADY AT LOGIC LEVEL 0,
+	JP	ALWAYSTRUE	; IT IS ALWAYS TRUE
+
+	DEC	A		; OTHERWISE USE THE PREVIOUS LOGIC LEVEL
+
+RDSTX:
+	JSR	STATBIT		; GET T/F BIT AS PER LOGIC LEVEL IN A
+
+TORF:
+	AND	A,[B]
+	IFNE	A,#0		; Set A to either 0 or FF
+ALWAYSTRUE:
+	LD	A,#0FF
+
+	LD	B,#ACC1L	; Special - this address is used a lot after
+				; calling these three subroutines...
+	RET			; Return 0 if bit is 0, FF if 1.	
+
+DECLEV:
+; decrement the current logic index, making sure never to
+; decrement it if it is 0
+;
+	IFEQ	CREG,#0		; Check current indent level
+	RET			; return if already 0
+
+	DRSZ	CREG		; Decrement CREG (current indent level)
+	RET		; ! (Should never skip this instruction)
+
+IFDECLEV:
+; decrement the logic level if the INDENT FLAG is set
+;
+	IFBIT	INDT,WKEDG	; IF LEVELFLAG IS SET
+	JP 	DECLEV		; THEN DO THE DECLEV
+
+	RET
+
+IFINCLEV:
+; Increment the logic level if the INDENT FLAG is clear
+;
+	IFBIT	INDT,WKEDG	; IF THE INDENT FLAG IS SET
+	RET			; RETURN
+
+;-- -- -- -- -- -- -- -- -- -- --;
+; Increment CREG and put         ;
+; previous value in A            ;
+;--------------------------------;
+INCREG:
+	LD	A,CREG
+	INC	A
+	X	A,CREG
+	RET
+
+;--------------------------------;
+; Test: A > [B] ?                ;
+;--------------------------------;
+; "IF A > [B]"   :  Do next instruction
+;		 :  Skip next instruction otherwise
+IFGTAB:
+	PUSH	A	; Check sign of A (bit 7)
+	RLC	A
+	POP	A
+
+	IFC		; If carry is set, it's negative
+	JP	AMINUS
+	
+	IFBIT	7,[B]	; Check sign of [B]
+	RET		; If negative, return normally
+CPAB:
+	IFGT	A,[B]	; If A > [B], return and execute next instruction
+	RET
+
+	RETSK		; otherwise, skip 
+AMINUS:
+	IFBIT	7,[B]	; Is [B] < 0 ?
+	JP	CPAB
+
+	RETSK		; A < 0 and B > 0 : A < B
+
+;
+; Subtract ACC2L from ACC2H and limit values to min/max if overflow
+; (signed 8 bit numbers)
+;
+SUBSIGN:
+	LD	B,#ACC2H
+	IFBIT	7,[B]		; 1st number negative ?
+	JP	HNEG
+	
+	LD	B,#ACC2L
+	IFBIT	7,[B]		; 1st positive, second negative ?
+	JP	HOVER		; Sub and test for overflow
+HLSAFE:
+	LD	B,#ACC2H
+	SC			; Subtract two positive numbers
+	LD	A,[B-]		; or two negative nummbers
+	SUBC	A,[B]		; (result must be safe)	
+
+	RET
+HNEG:
+	LD	B,#ACC2L
+	IFBIT	7,[B]
+	JP	HLSAFE		; Both negative ?
+
+; 1st negative, 2nd positive.
+	SBIT	LOCF,CNTRL	; Local T/F flag - watch for underflow
+	JP	SBTST
+HOVER:
+	RBIT	LOCF,CNTRL	; watch for overflow
+SBTST:
+	LD	B,#ACC2H
+	SC
+	LD	A,[B-]		; Subtracting now...
+	SUBC	A,[B]
+
+	PUSH	A		; Test sign of result
+	RLC	A
+	POP	A		; Is result negative ?
+
+	IFBIT	LOCF,CNTRL
+	JP	NGNG
+
+	IFC
+	LD	A,#07F		; If overflow happened, set to +127
+
+	RET
+NGNG:
+	IFNC	
+	LD	A,#080		; Limit to -128 if underflow
+
+	RET
+
+;--------------------------------;
+; Reset XYZ origin and clear     ;
+; reset flag.                    ;
+;--------------------------------;
+;
+RSTXYZ:
+	IFBIT	PERR,ECHOFLAGS	; Don't reset until all six receiver values
+	RET			; are valid in one cycle
+
+	LD	B,#GLBFLAGS
+
+	IFBIT	CTRX,[B]
+	JSR	CXOFFS
+
+	IFBIT	CTRY,[B]
+	JSR	CYOFFS
+
+	IFBIT	CTRZ,[B]
+	JSR	CZOFFS
+
+	RBIT	CTR,[B]		; Clear RESET (CENTER) mode
+
+	LD	B,#TURNX	; Set turning point initial values
+INITTURN:
+	LD	[B+],#0
+	IFBNE	#MAXTURN
+	JP	INITTURN
+NTRDY:
+	RET
+CXOFFS:			;( B = #GLBFLAGS )
+	LD	A,XABS		; Set new offset values for X, Y & Z
+	XOR	A,#0FF
+	INC	A
+	X	A,XOFS
+	RBIT	CTRX,[B]
+	RET
+CYOFFS:			;( B = #GLBFLAGS )
+	LD	A,YABS		; Set new offset values for X, Y & Z
+	XOR	A,#0FF
+	INC	A
+	X	A,YOFS
+	RBIT	CTRY,[B]
+	RET
+CZOFFS:			;( B = #GLBFLAGS )
+	LD	A,ZNORM		; Set new offset values for X, Y & Z
+	X	A,ZOFS		; Z not inverted... 
+	RBIT	CTRZ,[B]
+	RET
+
+;--------------------------------;
+; Calculate X or Y absolute      ;
+;--------------------------------;
+; CREG and DREG point to variables
+; Calculated as ( [CREG] - [DREG] ) / 4 + ACC2H 
+;
+GETCOORD:
+	LD	A,CREG
+	X	A,X
+	LD	A,DREG
+	X	A,B
+; Subtraction...
+	SC			; Set carry (clear borrow)
+	LD	A,[X+]	
+	SUBC	A,[B]		; (B cannot be auto incremented in SUBC)
+	X	A,ACC1L
+	LD	A,[B+]		; This is used just to increment B
+	LD	A,[X]
+	SUBC	A,[B]
+
+; Shift A|ACC1L right x 2        ;
+	LD	X,#2
+	LD	B,#ACC1L
+SHRGTL:
+	PUSH	A
+	RLC	A		; (Push sign bit into C)
+	POP	A
+
+	RRC	A		; Shift MSB
+	X	A,[B]
+	RRC	A		; Rotate LSB
+	X	A,[B]
+	
+	DRSZ	X
+	JP	SHRGTL
+
+	X	A,ACC1H		; (put away high result first)
+;-- -- -- -- -- -- -- -- -- -- --;
+; Add ACC2H offset to ACC1L:H    ;
+; and limit result to 8 bits     ;
+;--------------------------------;
+ACCOFF:				; (Entry point for offset add process)
+	LD	X,#ACC1L
+	LD	B,#ACC2H	; Add offset in ACC2H to ACC1
+
+	RC		
+	LD	A,[X]
+	ADC	A,[B]		; Add constant + Carry
+	X	A,[X]		; 
+	CLR	A
+	IFBIT	7,[B]		; Sign of constant ?
+	LD	A,#0FF		; (Sign extend)
+
+	LD	B,#ACC1H
+	ADC	A,[B]
+	X	A,[B]		; Add MSB
+
+; Fall through...
+
+;--------------------------------;
+; Limit signed value to 8 bit    :
+;--------------------------------;
+; Source is ACC1L|H, result returned in A and ACC1L
+; Output range = -128 to +127
+SIGN16:
+	LD	B,#ACC1H
+	LD	A,[B]
+	IFBIT	7,[B]		; Test high order byte for sign
+	JP	TEZN		; Negative result ?
+
+	LD	B,#ACC1L
+	IFNE	A,#0		; Upper byte <> 0 ?
+	LD	[B],#07F	; If 16 bit result is > 255, limit it.?
+
+	IFBIT	7,[B]		; MSB of lower byte = 1 ?
+	LD	[B],#07F	; If 8 bit result is > 127, limit it.
+
+	JP	AVZ
+TEZN:				; Negative limit tests...
+	LD	B,#ACC1L
+	IFNE	A,#0FF
+	LD	[B],#080
+
+	IFBIT	7,[B]
+	JP	AVZ
+
+	LD	[B],#080
+AVZ:
+	LD	A,[B]
+	RET
+
+;--------------------------------;
+; ACC1 <- ACC1 + [B] (16 bits)   ;
+;--------------------------------;
+ADD16:
+	LD	X,#ACC1L
+	RC			; Reset carry
+	LD	A,[X]
+	ADC	A,[B]		; add low order bytes
+	X	A,[X+]
+
+	LD	A,[B+]		; (Increment B)
+
+	LD	A,[X]
+	ADC	A,[B]		; add high order bytes
+	X	A,[X]		; Result goes in ACC1L and ACC1H
+	
+	RET
+
+;--------------------------------;
+; Switch read routines           ;
+;--------------------------------;
+; Assuming pullups on switch inputs that allow fast reading...
+
+RDROW:
+	LD	X,#4		; Settling time delay count (range = 0 - 15)
+RDRLP:
+	DRSZ	X		; Allow some settling time
+	JP	RDRLP
+	
+	LD	A,PORTI		; Read the data now.
+DSELALL:
+;;;	LD	B,#PORTCC
+	RBIT	6,[B]		; Deselect row X  X  X  X  Cl En 9  8
+
+	RBIT	5,[B]		; Deselect row 7  6  5  4  3  2  1  0     
+
+	SBIT	4,[B]		; Select row A  B  Sl St D  E  C  F
+				; For fast reading in G0EDGE interrupt
+	SBIT	1,PSW		; Reenable G0 edge interrupt
+
+	RET
+
+;--------------------------------;
+; Insert subroutine              ;
+;--------------------------------;
+;
+; Do block move to allow insertion of data.
+;
+INSERT:
+	LD	A,COUNT		; Check insert count
+	IFEQ	A,#0
+	JP	INSRR
+	X	A,CREG		; save in DREG
+EINS1:
+	LD	A,OFFSET	; Get start address for insert
+	IFGT	A,#ENDRAM
+INSRR:	JMP	INSERR
+
+	X	A,B		; Put insert address in B
+
+	CLR	A		; Fill w/0 (not neccessary ?)
+EINS2:				; Repeat until end of template RAM is reached
+	X	A,[B+]
+	IFEQ	B,#ENDRAM+1
+	JP	EINS3
+
+	JP	EINS2
+EINS3:
+	DRSZ	CREG		; Insert another space until insert count
+	JP	EINS1		; is reached.
+
+	LD	B,#SWMODE	; Don't leave mode 2 yet...
+	RET
+
+;--------------------------------;
+; Delete subroutine              ;
+;--------------------------------;
+;
+; Do block move to delete data.
+;
+DELETE:
+	LD	A,COUNT	
+	IFEQ	A,#0
+	JP	INSERR
+	X	A,CREG
+EDEL1:				; Slide everybody down one space
+	LD	B,#ENDRAM
+	LD	A,#ENDRAM+1
+	SC
+	SUBC	A,OFFSET
+	IFGT	A,#TEMPSIZE
+	JP	INSERR
+
+	X	A,X
+	CLR	A	
+EDEL2:				; Repeat N times
+	X	A,[B-]
+	DRSZ	X
+	JP	EDEL2
+
+	DRSZ	CREG
+	JP	EDEL1
+
+INSERR:
+	LD	B,#SWMODE
+	JMP	CLEND		; Reset edit flags
+
+;--------------------------------;
+; Scan switches                  ;
+;--------------------------------;
+ScanSw:
+;;;	RBIT	1,PSW		; Disable G0 edge interrupt
+	LD	B,#PORTCC
+	SBIT	4,[B]		; Select row 0 (un-tri-state line: D = 0)
+	JSR	RDROW		; Read switch row 0
+
+	LD	X,#19		; 20 Switches to scan
+	IFNE	A,#0FF
+	JMP	LookSw
+
+	RBIT	1,PSW		; Disable G0 edge interrupt
+;;;	LD	B,#PORTCC
+	RBIT	4,[B]   	; Deselect row 0 (tri-state line)
+	SBIT	5,[B]   	; Select row 1
+	JSR	RDROW
+
+	LD	X,#11		; 12 Switches to scan
+	IFNE	A,#0FF
+	JMP	LookSw
+
+	RBIT	1,PSW		; Disable G0 edge interrupt
+;;;	LD	B,#PORTCC
+	RBIT	4,[B]   	; Deselect row 0 (tri-state line)
+	SBIT	6,[B]   	; Select row 2
+	JSR	RDROW
+
+	OR	A,#0F0
+
+	LD	X,#3		; 4 Switches to scan
+	IFNE	A,#0FF	
+	JMP	LookSw
+
+; No switches down...
+	LD	SWR0H,#0FF	; Clear switch history
+	RET
+
+GoDelete:
+	RBIT	INSM,[B]
+	SBIT	DELM,[B]
+	JP	COMM1
+GoInsert:
+	SBIT	INSM,[B]
+	RBIT	DELM,[B]
+COMM1:
+	LD	A,SWACC		; Get BUFF
+	AND	A,#00F
+
+	IFBIT	DELM,[B]
+	JP	NOZERMAX
+
+	IFNE	A,#0		; If insert mode and byte count = 0, 
+	JP	NOZERMAX
+
+	RBIT	INSM,[B]	; Clear insert mode and
+	LD	A,#TEMPSIZE	; set overwrite mode (max count)
+NOZERMAX:
+	X	A,COUNT		; Store in count
+
+	RBIT	OFFS,[B]
+	SBIT	OFFM,[B]
+	SBIT	MODE2,[B]
+	RET
+
+;--------------------------------;
+; Store switch accumulator in RAM;
+;--------------------------------;
+;
+StoreByte:		; Subroutine
+	DRSZ	COUNT		; Decrement COUNT
+	NOP			; Fill byte
+
+	LD	B,#OFFSET
+	LD	A,[B]		; Get RAM pointer... increment it
+	INC	A
+	X	A,[B]		; Store incremented value, use pre-inc value
+	IFGT	A,#ENDRAM
+	JP	SKIPSB
+
+	X	A,X
+	LD	A,SWACC		; Store byte in RAM now.
+	X	A,[X]
+SKIPSB:
+	RET
+
+;--------------------------------;
+LookSw:
+	RRC	A		; Shift bits into Carry until a 0 is found
+	IFNC
+	JP	FndSw
+
+	DRSZ	X
+	JP	LookSw
+FndSw:				; Found a switch pressed...
+	X	A,X		; Put switch index in A
+	ADD	A,#L(TABL0)
+	JSR	LoadIndirect	; Get switch code
+
+	IFEQ	A,SWR0H		; Different from last scan ?
+	RET	
+
+	IFEQ	SWR0H,#084	; Was last switch a combo of ENTER & CLEAR ?
+	RET			; Wait for all keys to be released
+
+GotNybble:			; We now have a new key code in A
+	PUSH	A
+	X	A,SWR0H		; Save new switch history
+	POP	A
+
+; Test for Mode 1 (TEMPLATE SELECT MODE)
+	IFBIT	MODE1,WKEDG
+	JMP	SM1
+
+; That leaves Mode 0 (action/play mode)
+;
+	IFNE	A,#081
+	JP	NOEC
+;  Clear key down...
+EC:
+	SBIT	MODE1,WKEDG	; Set mode 1 flag
+
+	LD	SWMODE,#0	; Clear switch flags
+
+	LD	SWR0H,#084	; Set state history
+
+	JMP	BEEP		; Beep if mode 1 is just turning on
+NOEC:
+	IFGT	A,#081		; START or SELECT switch ?
+	JP	CJI
+
+	LD	B,#PUL2RATE
+
+	IFEQ	A,#080		; Enter switch ???
+	JP	TOGAB
+
+	IFGT	A,#09		; Unused buttons in this mode...
+	RET
+
+	IFEQ	A,#0		; Center always button ?
+	JP	CENTB
+
+	IFBIT	7,TEMPLATE	; Don't do these other functions if in 
+	RET			; glove mode.
+
+	ADD	A,#L(SWJUMPS-1)
+	JID
+
+TOGAB:				; Toggle AB swap mode
+	LD	A,[B]
+	XOR	A,#020		; Toggle 5,PUL2RATE	
+	X	A,[B]
+	JP	IBLIP	
+
+CJI:				; Clear joystick inhibit mode
+	LD	B,#PORTCD
+	LD	A,[B]
+	AND	A,#07F		; Clear bit
+	X	A,[B]		; Test previous state of bit 
+	IFGT	A,#07F
+	JSR	SETCENTER	; Set center mode if bit was set before
+	RET
+
+CENTB:				; Re-center X, Y and Z - then beep.
+	JSR	SETCENTER
+IBLIP:
+	JP	IBLEEP
+
+SWJUMPS:
+	.BYTE	L(INCSP1)	; 1
+	.BYTE	L(ONPUL1)	; 2
+	.BYTE	L(INCSP2)	; 3
+	.BYTE	L(ONPUL2)	; 4
+	.BYTE	L(SLOWMO)	; 5
+	.BYTE	L(DECSP1)	; 6
+	.BYTE	L(OFPUL1)	; 7
+	.BYTE	L(DECSP2)	; 8
+	.BYTE	L(OFPUL2)	; 9
+
+SLOWMO:				; Toggle slo-mo mode
+	LD	B,#WKEDG
+	LD	A,[B]
+	XOR	A,#SLOMASK
+	X	A,[B]
+IBLEEP:
+	JP	BLEEP
+
+; Handle pulse timer speed changes
+;
+INCSP1:
+	DRSZ	B		; (never reaches 0)
+INCSP2:
+	LD	A,[B]		; Look at 5 bit value
+	AND	A,#01F
+	IFEQ	A,#01F		; Don't change if at maximum
+	JP	VBEEP
+;;;	RET	
+
+	LD	A,[B]		; Increment and store
+	INC	A	
+STRATE:
+	X	A,[B]
+; Make a "blip" sound when any one of these values is CHANGED.
+	JP	VBEEP
+;;;
+BLEEP:
+	JMP	BLIP		; return through BLIP subroutine
+
+DECSP1:
+	DRSZ	B		; (never reaches 0)
+DECSP2:
+	LD	A,[B]
+	ANDSZ	A,#01F		; Don't decrement if already at zero...
+	JP	STNZ
+;;;
+VBEEP:
+	LD	A,[B]
+	AND	A,#01F
+	ADD	A,#L(QRTABLE)	
+	LD	B,#CREG
+	JSR	LDAIND		;(set [B])
+
+	LD	DREG,#50	; Duration of beep
+	JMP	BUZZ1
+;;;	RET
+STNZ:
+	LD	A,[B]
+	DEC	A
+	JP	STRATE
+
+ONPUL1:
+	DRSZ	B		; (never reaches 0)
+ONPUL2:
+	IFBIT	PULON,[B]
+	RET
+	SBIT	PULON,[B]
+BLAP:
+	JP	BLEEP
+OFPUL1:
+	DRSZ	B		; (never reaches 0)
+OFPUL2:
+	IFBIT	PULON,[B]
+	JP	SETOFF
+
+	RET
+SETOFF:
+	RBIT	PULON,[B]
+	JP	BLAP
+;
+; Switch data entry mode 1: template number entry.
+; A contains a nybble for the switch just pressed.
+;
+SM1:			; Switch mode 1 (template entry mode)
+	IFGT	A,#081		; Don't beep START or SELECT...
+	JP	NOBL
+
+	JSR	LBLIP		; Low freq beep
+NOBL:
+	LD	A,SWR0H
+
+	LD	B,#SWMODE	; Set B and leave it alone for a while...
+
+	IFGT	A,#07F		; Test bit 7
+	JMP	ENTCLR		; Special case for enter and clear
+
+	AND	A,#00F		; Keep only one hex digit
+	X	A,CHAR		; Save as current character
+
+	RBIT	CLRCNT,[B]   	; Since it wasn't a CLEAR, reset the 
+	RBIT	ENTCNT,[B]   	; CLEAR counter and ENTER counter.
+
+NYBACC:
+	IFBIT	DIGIT2,[B]   	; Check nybble counter
+	JP	OddNybble
+
+; Test for Mode 2 (TEMPLATE EDIT MODE)
+	IFBIT	MODE2,[B]   
+	JMP	SM2
+
+; Even Nybble			
+POINTA:				; BUFF <- CHAR; SWACC <- 0; DIGIT2 <- 1
+	LD	B,#SWMODE	; 
+	LD	A,CHAR
+	X	A,SWACC
+	SBIT	DIGIT2,[B]
+	RET
+
+CLPA:
+	LD	[B],#0		; Clear pointers before saving digit
+	JP	POINTA
+
+OddNybble:			; SWACC <- BUFF; BUFF <- DIGIT; DIGIT2 <- 0
+	LD	A,SWACC
+	SWAP	A	
+	AND	A,#0F0
+	OR	A,CHAR		; Move BUFF to SWACC, put CHAR in BUFF
+	X	A,SWACC
+	RBIT	DIGIT2,[B]
+	RET
+
+ENTCLR:		; ENTER or CLEAR has been pressed
+	IFGT	A,#081		; START and SELECT use codes 82,83
+	RET
+
+	IFEQ	A,#080
+	JP	ENTER
+CLEAR:
+	RBIT	ENTCNT,[B]	; Since it wasn't an ENT, clear that flag
+
+	IFBIT	CLRCNT,[B]	; Check CLEAR counter
+	JP	RESETALL	; If this is the second CLEAR, reset everything
+
+	SBIT	CLRCNT,[B]	; Set the CLEAR counter to 1
+
+	IFBIT	DIGIT2,[B]	; Which was last digit entered ?
+	JP	CL2DIG
+
+; BUFF <- SWACC; SWACC <- 0; DIGIT2 <- 1
+	LD	A,SWACC
+	SWAP	A
+	AND	A,#00F
+	X	A,SWACC
+
+	SBIT	DIGIT2,[B]
+
+	RET
+CL2DIG:
+	LD	SWACC,#0	; Clear BUFF and change DIGIT flag
+	RBIT	DIGIT2,[B]
+	RBIT	OFFS,[B]	; in case we are clearing the 1st digit
+				; of an offset...
+	RET
+
+RESETALL:
+	JSR	LoadZTemplate	; Load default template
+
+; Do a long beep here to signal template erasure
+	JSR	BEEP
+	JSR	BEEP
+	JMP	CLEND
+
+ENTER:
+	RBIT	CLRCNT,[B]	; Since it wasn't a CLEAR, reset the 
+				; CLEAR counter.
+
+	IFBIT	ENTCNT,[B]	; Check ENTER button count
+	JMP	GOACTION	; If it was pressed once already, 
+				; go to action/play mode now.
+	SBIT	ENTCNT,[B]	; Increment ENTER count
+
+	IFBIT	MODE2,[B]	; If ENTER pressed in mode 2, 
+	JMP	CHKOVW		; do nothing unless in overwrite mode
+
+	LD	A,SWACC
+	AND	A,#0F0
+	IFEQ	A,#0A0		; Insert/Overwrite mode ?
+	JMP	GoInsert
+	IFEQ	A,#0B0		; Delete mode ?
+	JMP	GoDelete
+;
+; Decimal to binary conversion (BCD to binary) (Template number)
+; No testing for illegal conditions, i.e. characters A-F in number.
+; Result = M*10 + L ; Where L = Least significant digit, M = most sig. digit.
+; Source = SWACC:BUFF (Switch Accumulator)
+;
+DEC2BIN:
+	LD	B,#SWACC	; Use B pointer to save bytes in instructions
+	LD	A,[B]
+	PUSH	A		; Save copy of A
+	AND	A,#0F0
+	SWAP	A		; Put MS digit in low 4 bits	
+	RC			; Multiply it by ten.
+	RLC	A
+	PUSH	A		; Save N x 2
+	RLC	A
+	RLC	A	
+	X	A,[B]		; Save N x 8
+	POP	A
+	ADD	A,[B]		; M x 10 = (M X 8) + (M X 2)
+	X	A,[B]
+	POP	A		; Get LS digit
+	AND	A,#00F		; Look at lower 4 bits of original BCD
+	ADD	A,[B]		; and add to result
+				; Converted value is in A
+	LD	B,#SWMODE
+; Test selected template number	
+	IFEQ	A,#0		; Null template ?
+	JP	CLEND
+
+	PUSH	A
+	JSR	CLEND		; Avoid excess stack levels this way...
+	POP	A
+; Now load selected template
+	JMP	LoadATemplate
+CLEND:				; Reset flags and go to template select mode.
+	LD	B,#SWMODE	; Clr all flags except MODE1, CLRCNT & ENTCNT
+	LD	A,[B]
+	AND	A,#SWMASK
+	X	A,[B]
+	RET
+
+GOACTION:
+	RBIT	MODE1,WKEDG
+
+	JSR	RSTFLEX		; Reset flex maxes and mins.
+	JSR	SETCENTER	; Set center mode (prepare for return to
+				; action mode)
+	JSR	BUILDTAB	; Build upload table if glove mode
+
+; Do a long beep/LED flash	;
+	JMP	BEEP	; high freq beep
+
+SM2:
+; Switch mode 2 - 1st digit of a byte just pressed
+
+	IFBIT	OFFM,[B]   	; Offset mode ?
+	JP	EDOFFMODE
+
+	LD	A,COUNT		; Check byte count...
+	IFEQ	A,#0		; Edit finished ?
+	JMP	CLPA		; Clear pointers and go to point A
+
+	JSR	StoreByte	; Store byte and go to point A
+	JMP	POINTA
+
+EDOFFMODE:		; Get data offset (two digits)
+	IFBIT	OFFS,[B]	; Offset in SWACC ?
+	JP	SETOS
+
+	SBIT	OFFS,[B]	; Continue collecting data
+	JP	GPANOW
+SETOS:				; Set offset
+	JSR	OSMODE
+
+	IFBIT	INSM,[B]	; Insert mode ?
+	JP	GOINS
+
+	IFBIT	DELM,[B]	; Delete mode ?
+	JP	GODEL
+GPANOW:				; Must be overwrite mode...
+	JMP	POINTA
+GOINS:
+	JSR	INSERT
+	JP	GPANOW
+GODEL:
+	JSR	DELETE
+	JP	GPANOW
+OSMODE:				; Subroutine: set offset and clear flags
+	LD	A,SWACC
+	ADD	A,#TEMPLATE
+
+	IFGT	A,#ENDRAM	; Check legal limit on offset
+	CLR	A
+
+	X	A,OFFSET
+	RBIT	OFFS,[B]
+	RBIT	OFFM,[B]
+	RET
+
+CHKOVW:			; ENT has been pressed, MODE2 = 1
+	IFBIT	OFFM,[B]
+	JP	OFFENT
+
+	IFEQ	COUNT,#0
+	JP	CLENX
+
+	JSR	StoreByte
+	JP	CLENX
+OFFENT:			; Handle insert / delete modes is offset is ok.
+	IFBIT	OFFS,[B]
+	JP	OFFFL
+	JP	CLENX
+OFFFL:
+	JSR	OSMODE		; Set offset
+	
+	IFBIT	DELM,[B]
+	JP	DODEL
+
+	IFBIT	INSM,[B]
+	JP	DOINS
+	JP	CLENX	
+DODEL:
+	JSR	DELETE
+	JP	CLENX	
+DOINS:
+	JSR	INSERT
+CLENX:
+	JMP	CLEND
+
+;--------------------------------;
+; Set flags to center X, Y and Z ;
+;--------------------------------;
+SETCENTER:
+	LD	A,#CAMASK	; Set Reset/center all mode
+	LD	B,#GLBFLAGS
+	OR	A,[B]   	; OR bits to be set with current status
+	X	A,[B]   	; and update flag register
+	RET
+
+;--------------------------------;
+; Set up for state bit access    ;
+;--------------------------------;
+STATCB:
+	LD	A,CREG
+STATBIT:			; A contains bit number to access
+	LD	B,#STATE	; in STATE bit array
+
+	IFGT	A,#007
+	LD	B,#STATE+1
+
+	IFGT	A,#00F
+	LD	B,#STATE+2
+
+	IFGT	A,#017
+	LD	B,#STATE+3
+
+	JP	GETBIT		; Return with B pointing to correct byte
+				; and A containing correct bitmask.
+
+;--------------------------------;
+; Set up for gesture bit access  ;
+;--------------------------------;
+GESTBIT:			; Look at current gesture
+	LD	A,GNUM		; Gesture number 1 - 16	
+AGBIT:
+	DEC	A
+GBX:
+	LD	B,#GSTAT1	; Gesture number 0 - 15
+	IFGT	A,#7
+	LD	B,#GSTAT2	; First byte of status flags
+
+; Fall through    v
+;--------------------------------;
+; A <- 2 ^A                      ;
+;--------------------------------;
+GETBIT:
+	AND	A,#07
+	ADD	A,#L(BITMASK)	; Load bitmask into A for proper bit
+	JMP	LoadIndirect
+
+;--------------------------------;
+; Increment GADDR variable       ;
+;--------------------------------;
+INCGAD:
+	LD	B,#GADDR
+	LD	A,[B]		; Increment gesture address
+	INC	A
+	X	A,[B]
+	RET
+
+;--------------------------------;
+; Take absolute value of A       ;
+;--------------------------------;
+;
+ABSACC:
+	PUSH	A
+	RLC	A
+	POP	A
+
+	IFNC
+	RET
+NEGACC:
+	XOR	A,#0FF
+	INC	A
+	RET
+
+;--------------------------------;
+; Get pointer to gesture header  ;
+;--------------------------------;
+GADB:
+	LD	A,GADDR
+	X	A,B		; Data pointer in B = gesture header byte
+	RET
+
+;--------------------------------;
+; Increment gesture pointers     ;
+;--------------------------------;
+NGINC:
+	LD	B,#GADDR
+	LD	A,[B]
+	INC	A
+	INC	A		; Increment gesture address
+	X	A,[B-]		; Increment gesture address
+; GNUM = GADDR-1
+	LD	A,[B]		; Increment gesture number
+	INC	A
+	X	A,[B]
+
+	DRSZ	NYREG		; Decrement gesture count
+	RET			; Normal return if not zero
+
+	RETSK			; Skip-return when NYREG = 0
+	
+;--------------------------------;
+; Initialize capture registers   ;
+;--------------------------------;
+RSTCAPT:
+	CLR	A	; Copy old data to all NEWxxx
+	JSR	BADXA	; Before starting a new cycle
+
+	LD	A,#2
+	JSR	BADXA
+
+	LD	A,#4
+	JMP	BADXA
+
+;--------------------------------;
+; Oscillate High Voltage  circuit;
+;--------------------------------;
+HVPULSE:
+	LD	CREG,#10		; Oscillate high voltage circuit
+OSC2:
+	IFBIT	7,PORTLP	; Check feedback input
+	RET			; quit if voltage is high enough
+
+	SBIT	3,PORTD		; Set PORTD bit 3
+	NOP			; Delay high period
+	NOP
+	RBIT	3,PORTD		; Clear bit
+	DRSZ	CREG
+	JP	OSC2
+
+	RET
+
+;--------------------------------;
+; Load a Template from ROM       ;
+;--------------------------------;
+; A contains the VALID template number
+;
+LoadZTemplate:
+	LD	A,#1
+LoadATemplate:
+	IFGT	A,#NUMTEMPLATES
+	RET			; Skip if template number is out of range
+
+; ROM template storage and lookup for NGP project/ Mattel
+; 2/1/89 (GK2)
+
+; assumes max 4 pages used (1k); can be modified if more space
+;	becomes available
+
+; templates are stored consecutively in ROM, skipping over the
+;  	last two bytes in each page (these bytes contain
+;	LAID, RET) - templates are located thru
+;	a search loop beginning with first template  
+
+; Gesture and logic counts must never = 0
+;
+TMLO	= 	ACC1L	;TM (template pointer) lo byte
+TMHI	=	ACC1H	;" hi byte- these bytes are only needed
+			;during table lookup
+; -------------
+
+	LD 	B,#TMLO		;find start of template
+	LD	[B+],#L(TMROM-1) 	;Acc has template #, 1 thru max#
+	LD	[B],#0		; H(TMROM-1)
+	X	A,CREG		;creg used for temp counter
+LNEXT:
+	LD	X,#TEMPLATE  	;setup RAM pointer (X reg)
+	JSR	INCBYT		;look at # of gesture entries
+;;	ANDSZ	A,#0F		;max 15
+;;	JP	GETGES		; If not 0, load gestures
+
+GETGES:				; Load gesture data into RAM (if CREG=1)
+	JSR	SAVXI		; Save header byte
+	RLC	A		; Multiply gesture count by 2
+	AND	A,#01E
+	JSR	DBYTES		;move TM up "Acc" bytes 
+				;and get # of logic bytes
+GETGAS:
+	JSR	INCBYT		;get to logic header
+
+	LD	B,#CNTRL
+	RBIT	LOCF,[B]
+	IFGT	A,#07F
+	SBIT	LOCF,[B]	; Watch for bit7 of logic count = 1
+
+	AND	A,#07F		; Clear it anyway
+
+	JSR	SAVXI		; Save logic count (not checked for zero)
+	JSR	DBYTES		;move thru the logic bytes
+
+	IFBIT	LOCF,CNTRL
+	JP	XTRA
+NOXTRA:
+	DRSZ	CREG		;count up until template reached	
+	JP	LNEXT
+	RET
+
+XTRA:
+	JSR	INCBYT		; Special case where two extra bytes are 
+	X	A,PUL1RATE	; included at end of template used to set
+	JSR	INCBYT		; the pulse rate and pulse on/off status.
+	X	A,PUL2RATE
+	JP	NOXTRA
+
+; -----------
+
+DBYTES:
+	X	A,DREG		;use for temp counter
+DBYTE1:
+	JSR	INCBYT		;also includes 'getbyt'	
+	IFEQ	CREG,#1
+	X	A,[X+]
+	DRSZ	DREG
+	JP	DBYTE1
+	RET
+
+; ------------
+
+SAVXI:				; Save A at [X] and increment X if
+	PUSH	A		; CREG = 1
+	IFEQ	CREG,#1
+	X	A,[X+]
+	POP	A
+	RET
+
+; ------------
+
+INCBYT:
+	LD	B,#TMLO		;counts up, skips last 2 bytes in each page
+INCTMA:
+	LD	A,[B]
+	INC	A
+	IFNE	A,#0FE
+	JP	INCTMB
+	LD	[B+],#0		;zero to TMlo and inc TMhi	
+	JP	INCTMA
+INCTMB:
+	X	A,[B]
+	; go thru to 'getbyt' below
+
+GETBYT:
+	LD	B,#TMLO		; gets byte referenced by data counter
+	LD	A,[B+]		;Acc <- TMlo
+	IFBIT	1,[B]		;B points to TMhi
+	JMP	TMPAG2
+	IFBIT	0,[B]
+	JMP	TMPAG1		;IF TMhi = 01
+	JMP	TMPAG0		;IF TMhi = 00
+
+; = = = = = = TEMPLATES = = = = = =
+;
+	.incld	PGTEMPL.INC	; Include templates last.
+
+; Include file contains LAID instructions
+; as well as data. 
+
+
+	.end
+;
